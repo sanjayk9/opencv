@@ -1701,6 +1701,13 @@ CV__DNN_INLINE_NS_BEGIN
         static Ptr<DetLayer> create(const LayerParams &params);
     };
 
+    /** @brief ONNX Dropout in eval mode: passes input through, mask output is all-true. */
+    class CV_EXPORTS DropoutMaskLayer : public Layer
+    {
+    public:
+        static Ptr<DropoutMaskLayer> create(const LayerParams &params);
+    };
+
     class CV_EXPORTS EyeLikeLayer : public Layer
     {
     public:
@@ -1823,6 +1830,10 @@ CV__DNN_INLINE_NS_BEGIN
     public:
         DataLayout layout;
         int C0;
+        // Set by graph_fusion_transform_add.cpp when a following elementwise Add
+        // (same-shape, no broadcasting) has been folded into this layer's
+        // deinterleave pass: inputs then holds [data, residual] instead of [data].
+        bool fusedAdd = false;
         static Ptr<TransformLayoutLayer> create(const LayerParams& params);
     };
 
@@ -1967,8 +1978,13 @@ CV__DNN_INLINE_NS_BEGIN
     };
 
     class CV_EXPORTS CumProdLayer : public Layer {
-     public:
+        public:
         static Ptr<CumProdLayer> create(const LayerParams &params);
+    };
+
+    class CV_EXPORTS BitCastLayer : public Layer {
+     public:
+        static Ptr<BitCastLayer> create(const LayerParams &params);
     };
 
     class CV_EXPORTS LinearAttentionLayer : public Layer {

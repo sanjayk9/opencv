@@ -48,6 +48,13 @@ typedef std::unordered_map<std::string, int64_t> NamesHash;
 
 #ifdef HAVE_ONNXRUNTIME
 struct OrtNamesCache;
+
+#ifdef _WIN32
+typedef std::wstring OrtPathString;
+#else
+typedef std::string OrtPathString;
+#endif
+OrtPathString toOrtPath(const std::string& utf8Path);
 #endif
 
 /** @brief Single entry in a @ref PerfProfile.
@@ -132,6 +139,7 @@ struct Net::Impl : public detail::NetImplBase
     KVCacheManager kvCacheManager;
 
     Ptr<Graph> mainGraph;
+    std::vector<int> mainGraphOutTypes;
     int globGraphIdx;
 
     int accuracy;
@@ -529,6 +537,7 @@ struct Net::Impl : public detail::NetImplBase
     void assignBuffers();
     // fuse batch norm, add bias and activation to convolution
     void fuseBasic();
+    void fuseChains();
     // fuse ViT-style multi-head attention subgraphs
     void fuseAttention();
     // rewrite MatMul(A, const_B [, const_bias]) into Gemm so projection-style
@@ -542,8 +551,13 @@ struct Net::Impl : public detail::NetImplBase
     void fuseTransposeMatMul();
     // fold a scalar Mul/Div before Softmax into Softmax::scale (CPU only)
     void fuseScaleSoftmax();
+    // fold a same-shape NaryEltwise Add into a preceding TransformLayout's
+    // deinterleave pass (CPU only): see graph_fusion_transform_add.cpp
+    void fuseTransformLayoutAdd();
     // replace constant sub-expressions with their results
 
+    // widen FP16/BF16 constants to execution precision while the engine lacks half kernels
+    void widenHalfConstants();
     void fuseQDQ();
     void constFold();
     // make some operations (activation, batch norm, convolution) unary if
