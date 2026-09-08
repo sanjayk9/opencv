@@ -566,15 +566,14 @@ public:
                 runOp(inp, outs[0]);
         } else {
             // [TODO] more efficient OpenCL implementation
+            // fusedAdd is never set here: fuseTransformLayoutAdd() only runs for
+            // DNN_BACKEND_OPENCV + DNN_TARGET_CPU, so this branch never sees it.
             Mat inp = inputs_arr.getMat(0);
             std::vector<UMat>& outs = outputs_arr.getUMatVecRef();
             outs.resize(1);
             outs[0].fit(outshape, inptype);
             Mat temp(outshape, inptype);
-            if (fusedAdd)
-                runOpAdd(inp, inputs_arr.getMat(1), temp);
-            else
-                runOp(inp, temp);
+            runOp(inp, temp);
             temp.copyTo(outs[0]);
         }
     }

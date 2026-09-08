@@ -72,17 +72,9 @@ static void deconvBlock32f(const void* inp__, const void* /*residual*/,
 
     const int NK1 = N * K1;
 
-    // Each (n, k1) task below walks the entire output plane serially, so NK1 on its
-    // own is the whole parallel decomposition -- and it is K1 = K/C0 wide, which for
-    // a narrow output is a small fraction of the core count (a 32-channel blocked
-    // output is just 4 tasks). Split the spatial range as well.
-    //
-    // Safe without any synchronisation: the loop gathers rather than scatters --
-    // it derives each contributing input position backwards from the output
-    // coordinates, and every opos_flat writes only its own C0-wide slot at
-    // out_k1 + opos_flat*C0 -- so distinct spatial chunks never touch the same
-    // output element. computeSpatChunks() returns 1 when NK1 already saturates the
-    // pool, leaving wide-output layers on their previous decomposition.
+    // NK1 alone can be too few tasks for a narrow output; split the spatial
+    // range too. Safe without synchronisation since the loop gathers rather
+    // than scatters -- each opos_flat only ever writes its own output slot.
     const int nSpatChunks   = computeSpatChunks(NK1, ospatial);
     const int spatChunkSize = (ospatial + nSpatChunks - 1) / nSpatChunks;
     const int total_tasks   = NK1 * nSpatChunks;

@@ -1,35 +1,23 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
+// Copyright (C) 2026, BigVision LLC, all rights reserved.
+// Third party copyrights are property of their respective owners.
 
-// Folds `TransformLayout -> NaryEltwise(Add)` into a single fused pass, when
-// the Add's other operand matches the converted tensor's shape exactly (no
-// broadcasting) and both are float32.
-//
-// Typical source: a layer like ConvTranspose2 produces its output in block
-// layout for its own SIMD efficiency; a TransformLayout node then converts it
-// back to plain NCHW before it can be added to a same-shaped NCHW tensor
-// (e.g. SAM2's decoder upsampling path adding back a high-resolution skip
-// connection). Unfused, that costs three full passes over the tensor: one
-// write by TransformLayout, one read of that by Add, one write by Add. The
-// deinterleave TransformLayout already performs can just as easily read the
-// second operand and add it in place of the final store, cutting that to two
-// passes with no separate Add layer at all.
-//
-// Pattern:
+// Folds `TransformLayout -> NaryEltwise(Add)` into a single fused pass:
 //   Block/NHWC -> TransformLayout -> NCHW ---\
 //                                              Add -> NCHW result
 //                       residual (NCHW) ------/
 //                =>
 //   Block/NHWC -> TransformLayout(+residual) -> NCHW result
-//
-// Declines whenever the channel count doesn't divide evenly by the
-// TransformLayout's C0: see the kernel comment in transform_layout_layer.cpp
-// for why that keeps the fused kernel's partial-block case (nzc < nc) out of
-// the picture entirely, rather than requiring it to be correct and tested.
+// TransformLayout already deinterleaves the tensor to NCHW; folding the Add
+// into that pass's final store saves one full read+write over the tensor.
+// Declines whenever the channel count doesn't divide evenly by C0 -- see the
+// kernel comment in transform_layout_layer.cpp for why.
 
 #include "precomp.hpp"
 #include "net_impl.hpp"
+#include "graph_fusion_util.hpp"
 
 namespace cv { namespace dnn {
 CV__DNN_INLINE_NS_BEGIN
@@ -60,16 +48,8 @@ struct ModelFusionTransformAdd
         vector<int> usecounts;
         netimpl->useCounts(usecounts);
 
-        std::set<int> externalArgs;
-        for (Arg out : graph->outputs())
-            externalArgs.insert(out.idx);
-
-        std::map<int, int> producer;
-        for (size_t i = 0; i < nops; i++) {
-            if (!prog[i]) continue;
-            for (Arg out : prog[i]->outputs)
-                producer[out.idx] = (int)i;
-        }
+        std::set<int> externalArgs = externalArgSet(graph);
+        std::map<int, int> producer = buildProducerMap(prog);
 
         vector<bool> dropped(nops, false);
 
@@ -142,15 +122,8 @@ struct ModelFusionTransformAdd
             }
         }
 
-        if (modified) {
-            vector<Ptr<LayerInfo>> newprog;
-            newprog.reserve(nops);
-            for (size_t i = 0; i < nops; i++) {
-                if (!dropped[i] && prog[i])
-                    newprog.push_back(prog[i]);
-            }
-            graph->setProg(newprog);
-        }
+        if (modified)
+            graph->setProg(rebuildProg(prog, dropped));
 
         return modified;
     }
