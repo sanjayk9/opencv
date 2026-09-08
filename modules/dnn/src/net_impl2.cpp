@@ -759,6 +759,9 @@ void Net::Impl::finalize()
     for (const Ptr<Graph>& g : allgraphs)
         finalizeGraph(g, useCUDA);
     useBlockLayout();
+    // Must run after useBlockLayout(), which is what inserts the
+    // TransformLayout nodes this pass fuses into.
+    fuseTransformLayoutAdd();
     assignBuffers();
     totalLayers = updateGraphOfs(mainGraph, 0, true);
 
