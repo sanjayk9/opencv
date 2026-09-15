@@ -1,6 +1,8 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
+//
+// Copyright (C) 2026, BigVision LLC, all rights reserved.
 
 #include "test_precomp.hpp"
 
@@ -168,6 +170,56 @@ TEST(videoio_pos_frames_exact, gstreamer_real_file_seek_stays_honest_either_way)
             ASSERT_TRUE(cap.read(frame)) << "target " << target;
         }
     }
+}
+
+// A synthetic file with a real GOP structure (unlike the live pipelines above) so a non-key-frame seek can exercise decode-forward correction for real, not just stay honest about not verifying.
+static std::string generateGstreamerGopFixture()
+{
+    std::string path = cv::tempfile(".mp4");
+    std::string pipeline = "appsrc ! videoconvert ! x264enc key-int-max=12 bframes=0 ! qtmux ! filesink location=" + path;
+    VideoWriter writer(pipeline, CAP_GSTREAMER, 0, 24.0, Size(64, 48), true);
+    if (!writer.isOpened())
+        return std::string();
+    for (int i = 0; i < 30; i++)
+        writer.write(Mat(48, 64, CV_8UC3, Scalar(i * 5 % 256, (i * 7 + 30) % 256, (i * 11 + 60) % 256)));
+    return path;
+}
+
+TEST(videoio_pos_frames_exact, gstreamer_decode_forward_corrects_at_least_one_landing)
+{
+    if (!videoio_registry::hasBackend(CAP_GSTREAMER))
+        throw SkipTestException("GStreamer backend was not found");
+
+    std::string path = generateGstreamerGopFixture();
+    if (path.empty())
+        throw SkipTestException("GStreamer x264enc encoder was not available to build the test fixture");
+
+    int exactNonKeyFrameCount = 0;
+    for (int target : {1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19, 20, 22, 23})
+    {
+        // A fresh capture per target sidesteps a separate, unrelated issue where many consecutive seeks on one GStreamer capture can eventually stall.
+        VideoCapture cap(path, CAP_GSTREAMER);
+        ASSERT_TRUE(cap.isOpened()) << "target " << target;
+        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+        int exact = cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT));
+        int landed = cvRound(cap.get(CAP_PROP_POS_FRAMES));
+        if (exact == 1)
+        {
+            EXPECT_EQ(target, landed) << "target " << target;
+            exactNonKeyFrameCount++;
+        }
+        else
+        {
+            EXPECT_NE(target, landed) << "target " << target << ": landed exactly but wasn't reported as exact";
+        }
+        Mat frame;
+        EXPECT_TRUE(cap.read(frame)) << "target " << target;
+    }
+
+    EXPECT_GT(exactNonKeyFrameCount, 0)
+        << "decode-forward correction never landed exactly on any non-key-frame target across the sweep";
+
+    remove(path.c_str());
 }
 
 }} // namespace

@@ -601,6 +601,7 @@ VideoCapture& VideoCapture::operator >> (UMat& image)
 }
 
 // Generic-layer CAP_PROP_POS_FRAMES seek: delegate the key-frame seek to the backend, then decode forward to land exactly on `value`.
+// The getCaptureDomain() checks below are a known layering shortcut (identity checks instead of a capability query); left as-is for now, see PR discussion.
 bool VideoCapture::seekPosFramesExact(double value)
 {
     lastPosFramesSeekExactness = -1;
@@ -619,7 +620,7 @@ bool VideoCapture::seekPosFramesExact(double value)
 
     const double target = std::floor(value);
 
-    // RAW mode (FFmpeg-only): no codec to decode forward with, so the backend's own key-frame seek is final; just check where it landed.
+    // RAW mode (FFmpeg-only): decode-forward via grabFrame() here silently pre-fetches the target frame's data, making the caller's next read() return target+1 -- see PR discussion; just report where the key-frame seek landed instead.
     if (icap->getCaptureDomain() == CAP_FFMPEG &&
         icap->getProperty(CAP_PROP_FORMAT) == static_cast<double>(CAP_PROP_UNKNOWN))
     {
@@ -631,7 +632,7 @@ bool VideoCapture::seekPosFramesExact(double value)
 
     // Unbounded/live source: no reliable target to chase (FFmpeg can clamp to frame 0 on duration-unknown streams), so accept wherever the backend's seek landed.
     const double frameCount = icap->getProperty(CAP_PROP_FRAME_COUNT);
-    if (frameCount == static_cast<double>(CAP_PROP_UNKNOWN) || frameCount <= 0)
+    if (frameCount <= 0) // covers both an unbounded source and CAP_PROP_UNKNOWN (-1)
     {
         double landedUnbounded = icap->getProperty(CAP_PROP_POS_FRAMES);
         if (landedUnbounded != static_cast<double>(CAP_PROP_UNKNOWN))
@@ -642,16 +643,9 @@ bool VideoCapture::seekPosFramesExact(double value)
     double landed = icap->getProperty(CAP_PROP_POS_FRAMES);
     if (landed == static_cast<double>(CAP_PROP_UNKNOWN))
     {
-        // Some backends (e.g. GStreamer) can't report position until a fresh buffer arrives; grab once before giving up.
-        if (!icap->grabFrame())
-            return false;
-        landed = icap->getProperty(CAP_PROP_POS_FRAMES);
-        if (landed == static_cast<double>(CAP_PROP_UNKNOWN))
-            return false;
+        // Can't verify without risking a grab that discards the frame the seek landed on; report success with exactness unknown instead.
+        return true;
     }
-
-    // Tracks whether decoding forward ever made confirmed progress, so a stuck/non-monotonic position reports failure rather than false success.
-    const double startLanded = landed;
 
     while (landed < target)
     {
@@ -663,15 +657,13 @@ bool VideoCapture::seekPosFramesExact(double value)
         double next = icap->getProperty(CAP_PROP_POS_FRAMES);
         if (next == static_cast<double>(CAP_PROP_UNKNOWN) || next <= landed)
         {
-            // Position reporting is unreliable/non-monotonic; stop rather than loop indefinitely.
-            bool madeProgress = landed > startLanded;
-            if (madeProgress)
-                lastPosFramesSeekExactness = 0;
-            return madeProgress;
+            // Position reporting became unreliable/non-monotonic mid-decode; the grab already happened, so the seek stands but exactness is left unknown.
+            return true;
         }
         landed = next;
     }
 
+    // landed may equal, or on some backends run past, target -- only an exact match counts as exact.
     lastPosFramesSeekExactness = (landed == target) ? 1 : 0;
     return true;
 }
