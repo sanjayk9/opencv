@@ -131,7 +131,7 @@ enum VideoCaptureAPIs {
 enum VideoCaptureProperties {
        CAP_PROP_UNKNOWN        =-1, //!< Returned by VideoCapture::get if the requested property is unknown or unsupported
        CAP_PROP_POS_MSEC       =0, //!< Current position of the video file in milliseconds.
-       CAP_PROP_POS_FRAMES     =1, //!< 0-based index of the frame to be decoded/captured next. `set(CAP_PROP_POS_FRAMES, i)` seeks to the nearest key frame k <= i then decodes forward to land exactly on i (see #CAP_PROP_POS_FRAMES_IS_EXACT); in RAW mode (CAP_PROP_FORMAT == -1) it always stops at k.
+       CAP_PROP_POS_FRAMES     =1, //!< 0-based index of the frame to be decoded/captured next. `set(CAP_PROP_POS_FRAMES, i)` seeks to the nearest key frame k <= i then attempts to decode forward to land exactly on i; depending on the backend's own position reporting, the actual landing may fall short of, on, or past i (see #CAP_PROP_POS_FRAMES_IS_EXACT). In RAW mode (CAP_PROP_FORMAT == -1) it always stops at k.
        CAP_PROP_POS_AVI_RATIO  =2, //!< Relative position of the video file: 0=start of the film, 1=end of the film.
        CAP_PROP_FRAME_WIDTH    =3, //!< Width of the frames in the video stream.
        CAP_PROP_FRAME_HEIGHT   =4, //!< Height of the frames in the video stream.

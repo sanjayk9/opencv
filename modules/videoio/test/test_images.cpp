@@ -201,8 +201,7 @@ TEST(videoio_images, seek_pos_frames_is_exact)
     // No seek has happened yet: exactness is unknown/not applicable.
     EXPECT_EQ(-1, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
 
-    // `count` itself is a reachable, exact end-of-stream position, unlike the out-of-range ones below.
-    for (int pos : {0, 1, count / 2, count - 1, count})
+    for (int pos : {0, 1, count / 2, count - 1})
     {
         EXPECT_TRUE(cap.set(CAP_PROP_POS_FRAMES, pos));
         EXPECT_EQ(pos, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES)));

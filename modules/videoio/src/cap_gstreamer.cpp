@@ -355,6 +355,8 @@ private:
     GstClockTime  readTimeout; // measured in nanoseconds
     bool          isPosFramesSupported;
     bool          isPosFramesEmulated;
+    // Set after a CAP_PROP_POS_FRAMES seek, cleared on retrieveFrame(); while set, grabFrame() re-pauses the pipeline after each grab -- see grabFrame().
+    bool          pausePipelineAfterGrab;
     bool          vEOS;
     bool          aEOS;
     bool          syncLastFrame;
@@ -423,6 +425,7 @@ GStreamerCapture::GStreamerCapture() :
     readTimeout(GSTREAMER_INTERRUPT_READ_DEFAULT_TIMEOUT_NS),
     isPosFramesSupported(false),
     isPosFramesEmulated(false),
+    pausePipelineAfterGrab(false),
     vEOS(false),
     aEOS(false),
     syncLastFrame(true),
@@ -584,6 +587,13 @@ bool GStreamerCapture::grabFrame()
         audioFrame.release();
         if (!aEOS)
             returnFlag &= grabAudioFrame();
+    }
+
+    // The generic layer's seek verification calls grabFrame() without retrieveFrame(); left PLAYING, the pipeline would keep advancing before the caller's own read(), so re-pause here and let retrieveFrame() clear the flag once a caller actually reads a frame.
+    if (returnFlag && pausePipelineAfterGrab && this->isPipelinePlaying())
+    {
+        gst_element_set_state(pipeline, GST_STATE_PAUSED);
+        gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
     }
 
     return returnFlag;
@@ -1131,6 +1141,9 @@ bool GStreamerCapture::retrieveVideoFrame(int, OutputArray dst)
 
 bool GStreamerCapture::retrieveFrame(int index, OutputArray dst)
 {
+    // A real caller is retrieving a frame now, so the seek-verification window (see grabFrame()) is over.
+    pausePipelineAfterGrab = false;
+
     if (index < 0)
         return false;
 
@@ -2021,9 +2034,16 @@ bool GStreamerCapture::setProperty(int propId, double value)
             CV_WARN("unable to seek");
             return false;
         }
-        // Certain mov and mp4 files seek incorrectly if the pipeline is not stopped before.
-        if (this->isPipelinePlaying()) {
-            this->stopPipeline();
+        // Get off PLAYING before seeking (some mov/mp4 files seek incorrectly otherwise), but pause rather than stopPipeline()'s full GST_STATE_NULL, which tears down negotiation and breaks every seek after the first.
+        if (this->isPipelinePlaying())
+        {
+            if (gst_element_set_state(pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE)
+            {
+                handleMessage(pipeline);
+                CV_WARN("GStreamer: unable to pause pipeline before seeking");
+                return false;
+            }
+            gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
         }
 
         if(!gst_element_seek_simple(GST_ELEMENT(pipeline.get()), GST_FORMAT_DEFAULT,
@@ -2034,6 +2054,12 @@ bool GStreamerCapture::setProperty(int propId, double value)
         }
         // wait for status update
         gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
+        // Nothing else clears vEOS/aEOS, so a prior full read-through would otherwise permanently block grabFrame() after every future seek.
+        vEOS = false;
+        aEOS = false;
+        lastFrame = false;
+        // No frame retrieved since this seek yet, so any grabFrame() calls before that (seek-exactness verification, most likely) should leave the pipeline paused -- see grabFrame().
+        pausePipelineAfterGrab = true;
         return true;
     }
     case CAP_PROP_POS_AVI_RATIO:
