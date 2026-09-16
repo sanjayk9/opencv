@@ -41,6 +41,8 @@
 
 #include "precomp.hpp"
 
+#include <cmath>
+
 #include "opencv2/videoio/registry.hpp"
 #include "videoio_registry.hpp"
 
@@ -519,6 +521,7 @@ void VideoCapture::release()
 {
     CV_TRACE_FUNCTION();
     icap.release();
+    lastPosFramesSeekExactness = -1;
 }
 
 bool VideoCapture::grab()
@@ -597,10 +600,82 @@ VideoCapture& VideoCapture::operator >> (UMat& image)
     return *this;
 }
 
+// Generic-layer CAP_PROP_POS_FRAMES seek: delegate the key-frame seek to the backend, then decode forward to land exactly on `value`.
+// The getCaptureDomain() checks below are a known layering shortcut (identity checks instead of a capability query); left as-is for now, see PR discussion.
+bool VideoCapture::seekPosFramesExact(double value)
+{
+    lastPosFramesSeekExactness = -1;
+
+    bool ret = icap->setProperty(CAP_PROP_POS_FRAMES, value);
+    if (!ret)
+    {
+        // Retry through CAP_PROP_POS_MSEC, except on GStreamer where a "successful" MSEC seek against a dead pipeline permanently breaks its frame-0 seek special case.
+        if (icap->getCaptureDomain() == CAP_GSTREAMER)
+            return false;
+        const double fps = icap->getProperty(CAP_PROP_FPS);
+        if (fps <= 0 || !icap->setProperty(CAP_PROP_POS_MSEC, value * 1000.0 / fps))
+            return false;
+        // Don't trust this success report alone; the verification below must still confirm forward progress.
+    }
+
+    const double target = std::floor(value);
+
+    // RAW mode (FFmpeg-only): decode-forward via grabFrame() here silently pre-fetches the target frame's data, making the caller's next read() return target+1 -- see PR discussion; just report where the key-frame seek landed instead.
+    if (icap->getCaptureDomain() == CAP_FFMPEG &&
+        icap->getProperty(CAP_PROP_FORMAT) == static_cast<double>(CAP_PROP_UNKNOWN))
+    {
+        double landedRaw = icap->getProperty(CAP_PROP_POS_FRAMES);
+        if (landedRaw != static_cast<double>(CAP_PROP_UNKNOWN))
+            lastPosFramesSeekExactness = (landedRaw == target) ? 1 : 0;
+        return true;
+    }
+
+    // Unbounded/live source: no reliable target to chase (FFmpeg can clamp to frame 0 on duration-unknown streams), so accept wherever the backend's seek landed.
+    const double frameCount = icap->getProperty(CAP_PROP_FRAME_COUNT);
+    if (frameCount <= 0) // covers both an unbounded source and CAP_PROP_UNKNOWN (-1)
+    {
+        double landedUnbounded = icap->getProperty(CAP_PROP_POS_FRAMES);
+        if (landedUnbounded != static_cast<double>(CAP_PROP_UNKNOWN))
+            lastPosFramesSeekExactness = (landedUnbounded == target) ? 1 : 0;
+        return true;
+    }
+
+    double landed = icap->getProperty(CAP_PROP_POS_FRAMES);
+    if (landed == static_cast<double>(CAP_PROP_UNKNOWN))
+    {
+        // Can't verify without risking a grab that discards the frame the seek landed on; report success with exactness unknown instead.
+        return true;
+    }
+
+    while (landed < target)
+    {
+        if (!icap->grabFrame())
+        {
+            lastPosFramesSeekExactness = 0; // ran out of frames before reaching the target
+            return true;
+        }
+        double next = icap->getProperty(CAP_PROP_POS_FRAMES);
+        if (next == static_cast<double>(CAP_PROP_UNKNOWN) || next <= landed)
+        {
+            // Position reporting became unreliable/non-monotonic mid-decode; the grab already happened, so the seek stands but exactness is left unknown.
+            return true;
+        }
+        landed = next;
+    }
+
+    // landed may equal, or on some backends run past, target -- only an exact match counts as exact.
+    lastPosFramesSeekExactness = (landed == target) ? 1 : 0;
+    return true;
+}
+
 bool VideoCapture::set(int propId, double value)
 {
     CV_CheckNE(propId, (int)CAP_PROP_BACKEND, "Can't set read-only property");
-    bool ret = !icap.empty() ? icap->setProperty(propId, value) : false;
+    bool ret = false;
+    if (!icap.empty())
+    {
+        ret = (propId == CAP_PROP_POS_FRAMES) ? seekPosFramesExact(value) : icap->setProperty(propId, value);
+    }
     if (!ret && throwOnFail)
     {
         CV_Error_(Error::StsError, ("could not set prop %d = %f", propId, value));
@@ -622,6 +697,10 @@ double VideoCapture::get(int propId) const
             return CAP_PROP_UNKNOWN;
         }
         return static_cast<double>(api);
+    }
+    if (propId == CAP_PROP_POS_FRAMES_IS_EXACT)
+    {
+        return static_cast<double>(lastPosFramesSeekExactness);
     }
     return !icap.empty() ? icap->getProperty(propId) : static_cast<double>(CAP_PROP_UNKNOWN);
 }

@@ -189,6 +189,48 @@ TEST(videoio_images, seek)
     }
 }
 
+TEST(videoio_images, seek_pos_frames_is_exact)
+{
+    // The images backend is always exact for in-range positions; out-of-range ones are approximate.
+    const int count = 20;
+    ImageCollection col;
+    col.generate(count, 5);
+    VideoCapture cap(col.getFirstFilename(), CAP_IMAGES);
+    ASSERT_TRUE(cap.isOpened());
+
+    // No seek has happened yet: exactness is unknown/not applicable.
+    EXPECT_EQ(-1, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+
+    for (int pos : {0, 1, count / 2, count - 1})
+    {
+        EXPECT_TRUE(cap.set(CAP_PROP_POS_FRAMES, pos));
+        EXPECT_EQ(pos, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES)));
+        EXPECT_EQ(1, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+    }
+
+    // Genuinely out-of-range: decoding forward runs out of frames before reaching the target.
+    cap.set(CAP_PROP_POS_FRAMES, count + 100);
+    EXPECT_EQ(0, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+}
+
+TEST(videoio_images, release_resets_pos_frames_is_exact)
+{
+    // A stale exactness verdict must not leak into a reused VideoCapture across release()/open().
+    ImageCollection col;
+    col.generate(20, 5);
+    VideoCapture cap(col.getFirstFilename(), CAP_IMAGES);
+    ASSERT_TRUE(cap.isOpened());
+
+    ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, 5));
+    ASSERT_EQ(1, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+
+    cap.release();
+    EXPECT_EQ(-1, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+
+    ASSERT_TRUE(cap.open(col.getFirstFilename(), CAP_IMAGES));
+    EXPECT_EQ(-1, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+}
+
 TEST(videoio_images, pattern_overflow)
 {
     // check files: test0.png, ..., test11.png

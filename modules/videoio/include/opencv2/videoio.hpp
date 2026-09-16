@@ -131,7 +131,7 @@ enum VideoCaptureAPIs {
 enum VideoCaptureProperties {
        CAP_PROP_UNKNOWN        =-1, //!< Returned by VideoCapture::get if the requested property is unknown or unsupported
        CAP_PROP_POS_MSEC       =0, //!< Current position of the video file in milliseconds.
-       CAP_PROP_POS_FRAMES     =1, //!< 0-based index of the frame to be decoded/captured next. When the index i is set in RAW mode (CAP_PROP_FORMAT == -1) this will seek to the key frame k, where k <= i.
+       CAP_PROP_POS_FRAMES     =1, //!< 0-based index of the frame to be decoded/captured next. `set(CAP_PROP_POS_FRAMES, i)` seeks to the nearest key frame k <= i then attempts to decode forward to land exactly on i; depending on the backend's own position reporting, the actual landing may fall short of, on, or past i (see #CAP_PROP_POS_FRAMES_IS_EXACT). In RAW mode (CAP_PROP_FORMAT == -1) it always stops at k.
        CAP_PROP_POS_AVI_RATIO  =2, //!< Relative position of the video file: 0=start of the film, 1=end of the film.
        CAP_PROP_FRAME_WIDTH    =3, //!< Width of the frames in the video stream.
        CAP_PROP_FRAME_HEIGHT   =4, //!< Height of the frames in the video stream.
@@ -205,6 +205,7 @@ enum VideoCaptureProperties {
        CAP_PROP_PTS = 71, //!<  (read-only) FFmpeg back-end only - presentation timestamp of the most recently read frame using the FPS time base.  e.g. fps = 25, VideoCapture::get(\ref CAP_PROP_PTS) = 3, presentation time = 3/25 seconds.
        CAP_PROP_DTS_DELAY = 72, //!<  (read-only) FFmpeg back-end only - maximum difference between presentation (pts) and decompression timestamps (dts) using FPS time base.  e.g. delay is maximum when frame_num = 0, if true, VideoCapture::get(\ref CAP_PROP_PTS) = 0 and VideoCapture::get(\ref CAP_PROP_DTS_DELAY) = 2, dts = -2.  Non zero values usually imply the stream is encoded using B-frames which are not decoded in presentation order.
        CAP_PROP_IMAGE_SEQ_START = 73, //!< (**open-only**) Start number for image sequences opened with a printf-style pattern (e.g. `frame_%05d.dpx`). Sets the initial frame number and disables automatic first-frame detection. Applicable to \ref CAP_FFMPEG (passed as the image2 demuxer `start_number`) and \ref CAP_IMAGES backends. Default: not set (automatic detection).
+       CAP_PROP_POS_FRAMES_IS_EXACT = 74, //!< (read-only) Whether the last #CAP_PROP_POS_FRAMES seek landed exactly on the requested frame: `1` exact, `0` approximate, `-1` unknown/not applicable.
 #ifndef CV_DOXYGEN
        CV__CAP_PROP_LATEST
 #endif
@@ -1055,6 +1056,12 @@ public:
 protected:
     Ptr<IVideoCapture> icap;
     bool throwOnFail;
+
+    // Exactness of the most recent CAP_PROP_POS_FRAMES seek, queried via get(CAP_PROP_POS_FRAMES_IS_EXACT).
+    int lastPosFramesSeekExactness = -1;
+
+    // Generic-layer CAP_PROP_POS_FRAMES seek: delegates to icap, then decodes forward to land exactly on `value`.
+    bool seekPosFramesExact(double value);
 
     friend class internal::VideoCapturePrivateAccessor;
 };
