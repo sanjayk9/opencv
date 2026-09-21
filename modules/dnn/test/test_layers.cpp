@@ -614,8 +614,8 @@ TEST_P(Test_Caffe_layers, Average_pooling_kernel_area)
     // 4 5 | 6
     // ----+--
     // 7 8 | 9
-    Mat inp = (Mat_<float>(3, 3) << 1, 2, 3, 4, 5, 6, 7, 8, 9);
-    Mat ref = (Mat_<float>(2, 2) << (1 + 2 + 4 + 5) / 4.f, (3 + 6) / 2.f, (7 + 8) / 2.f, 9);
+    Mat inp = Mat_<float>({3, 3}, {1, 2, 3, 4, 5, 6, 7, 8, 9});
+    Mat ref = Mat_<float>({2, 2}, {(1 + 2 + 4 + 5) / 4.f, (3 + 6) / 2.f, (7 + 8) / 2.f, 9});
     Mat tmp = blobFromImage(inp);
     net.setInput(blobFromImage(inp));
     net.setPreferableBackend(backend);
@@ -652,10 +652,12 @@ TEST_P(Test_Caffe_layers, PriorBox_squares)
     net.setPreferableTarget(target);
     Mat out = net.forward();
 
-    Mat ref = (Mat_<float>(4, 4) << 0.0, 0.0, 0.75, 1.0,
-                                       0.25, 0.0, 1.0, 1.0,
-                                       0.1f, 0.1f, 0.2f, 0.2f,
-                                       0.1f, 0.1f, 0.2f, 0.2f);
+    Mat ref = Mat_<float>({4, 4}, {
+            0.0, 0.0, 0.75, 1.0,
+            0.25, 0.0, 1.0, 1.0,
+            0.1f, 0.1f, 0.2f, 0.2f,
+            0.1f, 0.1f, 0.2f, 0.2f
+    });
     double l1 = 1e-5;
     if (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD || target == DNN_TARGET_CUDA_FP16)
         l1 = 2e-5;
@@ -2495,12 +2497,9 @@ public:
         }
         Y.setTo(0);
 
-        std::vector<Range> ranges_pref;
-        if (layout == "3d") {
-            ranges_pref = {Range::all(), Range(0, T_pref), Range::all()};
-        } else {
-            ranges_pref = {Range::all(), Range::all(), Range(0, T_pref), Range::all()};
-        }
+        std::vector<Range> ranges_pref = (layout == "3d")
+                         ? std::vector<Range>{Range::all(), Range(0, T_pref), Range::all()}
+                         : std::vector<Range>{Range::all(), Range::all(), Range(0, T_pref), Range::all()};
 
         Mat Q_pref = Q_all(ranges_pref);
         Mat K_pref = K_all(ranges_pref);
@@ -2515,12 +2514,9 @@ public:
         // 2. Generate
         for(int t = T_pref; t < T; t++)
         {
-            std::vector<Range> ranges_gen;
-            if (layout == "3d") {
-                ranges_gen = {Range::all(), Range(t, t + 1), Range::all()};
-            } else {
-                ranges_gen = {Range::all(), Range::all(), Range(t, t + 1), Range::all()};
-            }
+            std::vector<Range> ranges_gen = (layout == "3d")
+                                          ? std::vector<Range>{Range::all(), Range(t, t + 1), Range::all()}
+                                          : std::vector<Range>{Range::all(), Range::all(), Range(t, t + 1), Range::all()};
 
             netWithKVCache.setInput(Q_all(ranges_gen), "Q");
             netWithKVCache.setInput(K_all(ranges_gen), "K");
@@ -2585,9 +2581,9 @@ public:
         for (int lo = 0; lo < T; )
         {
             int hi = (lo == 0) ? T_pref : std::min(lo + chunk, T);
-            std::vector<Range> qr;
-            if (layout == "3d") qr = { Range::all(), Range(lo, hi), Range::all() };
-            else                qr = { Range::all(), Range::all(), Range(lo, hi), Range::all() };
+            std::vector<Range> qr = (layout == "3d")
+                                    ? std::vector<Range>{ Range::all(), Range(lo, hi), Range::all() }
+                                    : std::vector<Range>{ Range::all(), Range::all(), Range(lo, hi), Range::all() };
             std::vector<Range> mr = { Range::all(), Range::all(), Range(lo, hi), Range(0, hi) };
 
             netWithKVCache.setInput(Q_all(qr), "Q");
