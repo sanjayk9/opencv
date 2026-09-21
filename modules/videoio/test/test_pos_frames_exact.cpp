@@ -1,8 +1,8 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
-//
 // Copyright (C) 2026, BigVision LLC, all rights reserved.
+// Third party copyrights are property of their respective owners.
 
 #include "test_precomp.hpp"
 
@@ -172,6 +172,14 @@ TEST(videoio_pos_frames_exact, gstreamer_real_file_seek_stays_honest_either_way)
     }
 }
 
+// Each encoded frame is a flat, distinct color so a decoded frame's content can be matched back
+// to its source index -- this is what lets gstreamer_read_after_seek_does_not_skip_the_landed_frame
+// below tell "read() returned the frame the seek landed on" apart from "read() returned the next one".
+static Scalar gstreamerGopFixtureFrameColor(int i)
+{
+    return Scalar(i * 5 % 256, (i * 7 + 30) % 256, (i * 11 + 60) % 256);
+}
+
 // A synthetic file with a real GOP structure (unlike the live pipelines above) so a non-key-frame seek can exercise decode-forward correction for real, not just stay honest about not verifying.
 static std::string generateGstreamerGopFixture()
 {
@@ -181,7 +189,7 @@ static std::string generateGstreamerGopFixture()
     if (!writer.isOpened())
         return std::string();
     for (int i = 0; i < 30; i++)
-        writer.write(Mat(48, 64, CV_8UC3, Scalar(i * 5 % 256, (i * 7 + 30) % 256, (i * 11 + 60) % 256)));
+        writer.write(Mat(48, 64, CV_8UC3, gstreamerGopFixtureFrameColor(i)));
     return path;
 }
 
@@ -219,6 +227,62 @@ TEST(videoio_pos_frames_exact, gstreamer_decode_forward_corrects_at_least_one_la
     EXPECT_GT(exactNonKeyFrameCount, 0)
         << "decode-forward correction never landed exactly on any non-key-frame target across the sweep";
 
+    remove(path.c_str());
+}
+
+// Regression test for a bug found while verifying this feature manually (not caught by either
+// GitHub review round, and not caught by the test above): correctPosFramesLanding()'s own
+// decode-forward loop grabs frames internally to walk up to the target, and the grab that lands
+// exactly on the target must be left for the caller's own read() to consume -- not silently
+// discarded. Before the fix, that landing grab's sample was thrown away and the *following*
+// grabFrame() call (i.e. the grab() half of the caller's read()) pulled a fresh sample one frame
+// past the target -- so read() silently returned the wrong frame's pixels while
+// CAP_PROP_POS_FRAMES_IS_EXACT still confidently reported 1. Checking only the reported position
+// (as every other test in this file does) can't see this bug: the position was reported correctly
+// the whole time, only the decoded pixel content was wrong. This test decodes the frame and checks
+// its actual color against the target index, not the index after it.
+TEST(videoio_pos_frames_exact, gstreamer_read_after_seek_does_not_skip_the_landed_frame)
+{
+    if (!videoio_registry::hasBackend(CAP_GSTREAMER))
+        throw SkipTestException("GStreamer backend was not found");
+
+    std::string path = generateGstreamerGopFixture();
+    if (path.empty())
+        throw SkipTestException("GStreamer x264enc encoder was not available to build the test fixture");
+
+    // Non-monotonic on purpose: an earlier seek priming the pipeline, then non-key-frame targets
+    // that require decode-forward, mirroring the real seek pattern the bug was originally found
+    // under (repeated seeks on one capture, not just a single isolated seek).
+    int targets[] = {5, 2, 8, 4, 11, 19, 23};
+
+    VideoCapture cap(path, CAP_GSTREAMER);
+    ASSERT_TRUE(cap.isOpened());
+
+    for (int target : targets)
+    {
+        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+        if (cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)) != 1)
+            continue; // only checking cases the backend itself claims are exact
+
+        Mat frame;
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
+
+        Scalar meanColor = mean(frame);
+        Scalar expected = gstreamerGopFixtureFrameColor(target);
+        Scalar nextFrameColor = gstreamerGopFixtureFrameColor(target + 1);
+
+        // The regression: a skipped frame lands much closer to target+1's color than target's.
+        double distToTarget = cv::norm(meanColor - expected, NORM_L1);
+        double distToNext = cv::norm(meanColor - nextFrameColor, NORM_L1);
+        EXPECT_LT(distToTarget, distToNext)
+            << "target " << target << ": read() returned frame " << (target + 1)
+            << "'s content instead of the frame the seek landed on (exact=1 was reported)";
+        EXPECT_LE(distToTarget, 15.0)
+            << "target " << target << ": decoded color too far from the expected flat color "
+            << "for this target frame (encoder noise budget)";
+    }
+
+    cap.release();
     remove(path.c_str());
 }
 
