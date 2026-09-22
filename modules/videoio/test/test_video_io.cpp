@@ -38,8 +38,17 @@ protected:
             std::cout << "Seek to frame '" << idx << "' is not supported. SKIP." << std::endl;
             return;
         }
-        EXPECT_EQ(idx, (int)cap.get(CAP_PROP_POS_FRAMES));
-        checkFrameRead(idx, cap);
+        int landedIdx = idx;
+        if (cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)) == 1)
+        {
+            EXPECT_EQ(idx, (int)cap.get(CAP_PROP_POS_FRAMES));
+        }
+        else
+        {
+            // Some backends (GStreamer) can only approximate a seek; check against where it actually landed, not idx.
+            landedIdx = (int)cap.get(CAP_PROP_POS_FRAMES);
+        }
+        checkFrameRead(landedIdx, cap);
     }
 public:
     void doTest()
