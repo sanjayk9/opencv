@@ -172,6 +172,7 @@ bool CvCapture_Images::setProperty(int id, double value)
             CV_WARN("seeking to negative positions does not work - clamping");
             value = 0;
         }
+        value = std::floor(value); // round down like other backends, before the range check
         if(value >= length) {
             CV_WARN("seeking beyond end of sequence - clamping");
             value = length - 1;

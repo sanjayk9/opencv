@@ -600,47 +600,31 @@ VideoCapture& VideoCapture::operator >> (UMat& image)
     return *this;
 }
 
-// Generic-layer CAP_PROP_POS_FRAMES seek: delegate the seek to the backend, then compute the exactness verdict.
-// The CAP_FFMPEG identity check below (RAW-mode carve-out) is a known layering shortcut -- a real capability
-// query would need a new IVideoCapture virtual, which isn't reachable through the C plugin ABI without an API
-// version bump (plugin_capture_api.hpp has no slot for it) -- left as an identity check for now.
+// The backend does the seek; here we only read the position back and record whether it hit the target.
 bool VideoCapture::seekPosFramesExact(double value)
 {
     lastPosFramesSeekExactness = -1;
 
+    // Treat a negative target as frame 0 before the backend sees it.
+    value = std::max(value, 0.0);
+
     if (!icap->setProperty(CAP_PROP_POS_FRAMES, value))
         return false;
 
+    // XINE and AVFoundation report the requested position back, so a read-back proves nothing.
+    const int api = icap->getCaptureDomain();
+    if (api == CAP_XINE || api == CAP_AVFOUNDATION)
+        return true;
+
+    const double landed = icap->getProperty(CAP_PROP_POS_FRAMES);
+    if (landed == static_cast<double>(CAP_PROP_UNKNOWN))
+        return true;
+
     const double target = std::floor(value);
+    lastPosFramesSeekExactness = (landed == target) ? 1 : 0;
 
-    // RAW mode (FFmpeg-only): decode-forward via grabFrame() here silently pre-fetches the target frame's data, making the caller's next read() return target+1 -- see PR discussion; just report where the key-frame seek landed instead.
-    if (icap->getCaptureDomain() == CAP_FFMPEG &&
-        icap->getProperty(CAP_PROP_FORMAT) == static_cast<double>(CAP_PROP_UNKNOWN))
-    {
-        double landedRaw = icap->getProperty(CAP_PROP_POS_FRAMES);
-        if (landedRaw != static_cast<double>(CAP_PROP_UNKNOWN))
-            lastPosFramesSeekExactness = (landedRaw == target) ? 1 : 0;
-        return true;
-    }
-
-    // Unbounded/live source: no reliable target to chase (FFmpeg can clamp to frame 0 on duration-unknown streams), so accept wherever the backend's seek landed.
-    const double frameCount = icap->getProperty(CAP_PROP_FRAME_COUNT);
-    if (frameCount <= 0) // covers both an unbounded source and CAP_PROP_UNKNOWN (-1)
-    {
-        double landedUnbounded = icap->getProperty(CAP_PROP_POS_FRAMES);
-        if (landedUnbounded != static_cast<double>(CAP_PROP_UNKNOWN))
-            lastPosFramesSeekExactness = (landedUnbounded == target) ? 1 : 0;
-        return true;
-    }
-
-    // Decode-forward correction for a key-frame seek that lands short of `target` now happens inside whichever
-    // backend's own seek can do that -- currently only GStreamer (GStreamerCapture::setProperty), which fixes it
-    // before this point. Every other backend's CAP_PROP_POS_FRAMES seek either fails outright or lands exactly
-    // (verified for FFmpeg non-RAW, MSMF, CAP_IMAGES, MJPEG, AVFoundation and XINE), so a plain read-back is
-    // sufficient here without re-deriving it via a decode-forward loop or a backend identity check.
-    double landed = icap->getProperty(CAP_PROP_POS_FRAMES);
-    lastPosFramesSeekExactness = (landed == static_cast<double>(CAP_PROP_UNKNOWN)) ? -1 : ((landed == target) ? 1 : 0);
-    return true;
+    // Landing short of the target is approximate; landing past it skips frames, so it is a failed seek.
+    return landed <= target;
 }
 
 bool VideoCapture::set(int propId, double value)

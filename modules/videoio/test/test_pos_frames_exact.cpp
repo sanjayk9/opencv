@@ -59,7 +59,7 @@ TEST(videoio_pos_frames_exact, ffmpeg_raw_mode_seek_is_exact_only_on_key_frames)
     }
 }
 
-// Sweeps every frame in the file, in both modes, to confirm the backend's key-frame seek never overshoots (grabFrame() can't correct an overshoot).
+// Sweeps every frame in the file, in both modes: landing past the target would make set() fail.
 TEST(videoio_pos_frames_exact, ffmpeg_seek_never_lands_past_the_target)
 {
     if (!videoio_registry::hasBackend(CAP_FFMPEG))
@@ -84,6 +84,64 @@ TEST(videoio_pos_frames_exact, ffmpeg_seek_never_lands_past_the_target)
     }
 }
 
+static std::vector<Mat> readAllFrames(const std::string& path, int api, int maxFrames)
+{
+    std::vector<Mat> frames;
+    VideoCapture cap(path, api);
+    Mat frame;
+    while ((int)frames.size() < maxFrames && cap.read(frame))
+        frames.push_back(frame.clone());
+    return frames;
+}
+
+// A timestamp seek to the start of this MPEG-PS file lands on frame 12, so early targets need a verified rewind.
+TEST(videoio_pos_frames_exact, ffmpeg_seek_near_start_of_mpeg_ps_is_exact)
+{
+    if (!videoio_registry::hasBackend(CAP_FFMPEG))
+        throw SkipTestException("FFmpeg backend was not found");
+
+    const std::string path = findDataFile("video/big_buck_bunny.mpg");
+    std::vector<Mat> reference = readAllFrames(path, CAP_FFMPEG, 16);
+    ASSERT_EQ(16u, reference.size());
+
+    for (int target = 0; target < 16; target++)
+    {
+        VideoCapture cap(path, CAP_FFMPEG);
+        ASSERT_TRUE(cap.isOpened());
+        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+        EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << "target " << target;
+        EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
+        Mat frame;
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
+        EXPECT_EQ(0, cvtest::norm(frame, reference[target], NORM_INF)) << "target " << target;
+    }
+}
+
+// This AVI can't be rewound verifiably, so a seek must report unknown rather than a wrong exact landing.
+TEST(videoio_pos_frames_exact, ffmpeg_unverifiable_seek_does_not_claim_exact)
+{
+    if (!videoio_registry::hasBackend(CAP_FFMPEG))
+        throw SkipTestException("FFmpeg backend was not found");
+
+    const std::string path = findDataFile("video/VID00003-20100701-2204.avi");
+    std::vector<Mat> reference = readAllFrames(path, CAP_FFMPEG, 16);
+    ASSERT_EQ(16u, reference.size());
+
+    for (int target = 0; target < 16; target++)
+    {
+        VideoCapture cap(path, CAP_FFMPEG);
+        ASSERT_TRUE(cap.isOpened());
+        cap.set(CAP_PROP_POS_FRAMES, target);
+        const bool claimsExact = cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)) == 1;
+        Mat frame;
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
+        if (claimsExact)
+        {
+            EXPECT_EQ(0, cvtest::norm(frame, reference[target], NORM_INF)) << "target " << target;
+        }
+    }
+}
+
 // Intra-only codec: every frame is its own key frame, so this is CAP_IMAGES-like -- always exact.
 TEST(videoio_pos_frames_exact, opencv_mjpeg_seek_is_always_exact)
 {
@@ -102,7 +160,6 @@ TEST(videoio_pos_frames_exact, opencv_mjpeg_seek_is_always_exact)
     }
 }
 
-// A synthetic pipeline avoids qtdemux specifics, but position querying here is still consistently unverifiable in practice.
 static std::string posFramesExactGstreamerPipeline(int srcFrameCount, double srcFps)
 {
     std::ostringstream pipeline;
@@ -111,8 +168,8 @@ static std::string posFramesExactGstreamerPipeline(int srcFrameCount, double src
     return pipeline.str();
 }
 
-// A seek this backend accepts but can't verify must report -1, never a false 1; a verified one must match where it landed.
-TEST(videoio_pos_frames_exact, gstreamer_synthetic_pipeline_seek_stays_honest_either_way)
+// videotestsrc has no duration: only a seek to frame 0 works, and a failed seek must not claim exact.
+TEST(videoio_pos_frames_exact, gstreamer_pipeline_without_duration_only_seeks_to_start)
 {
     if (!videoio_registry::hasBackend(CAP_GSTREAMER))
         throw SkipTestException("GStreamer backend was not found");
@@ -122,27 +179,26 @@ TEST(videoio_pos_frames_exact, gstreamer_synthetic_pipeline_seek_stays_honest_ei
     ASSERT_TRUE(cap.isOpened());
 
     Mat frame;
-    ASSERT_TRUE(cap.read(frame)); // prime: matches the preroll state a real caller would be in
+    ASSERT_TRUE(cap.read(frame));
 
-    for (int target : {0, 5, 10, 20, 29})
+    for (int target : {0, 5, 0, 20})
     {
-        bool ok = cap.set(CAP_PROP_POS_FRAMES, target);
-        double exact = cap.get(CAP_PROP_POS_FRAMES_IS_EXACT);
-        if (!ok)
+        if (target == 0)
         {
-            EXPECT_NE(1, cvRound(exact)) << "target " << target;
-            continue;
+            ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target));
+            EXPECT_EQ(0, cvRound(cap.get(CAP_PROP_POS_FRAMES)));
+            EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
         }
-        if (cvRound(exact) == 1)
+        else
         {
-            EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << "target " << target;
+            EXPECT_FALSE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+            EXPECT_EQ(-1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
         }
         ASSERT_TRUE(cap.read(frame)) << "target " << target;
     }
 }
 
-// #10324: seeking on a real container is unreliable in ways the generic layer can't fix; this only checks the contract stays honest either way.
-TEST(videoio_pos_frames_exact, gstreamer_real_file_seek_stays_honest_either_way)
+TEST(videoio_pos_frames_exact, gstreamer_real_file_seek_is_exact)
 {
     if (!videoio_registry::hasBackend(CAP_GSTREAMER))
         throw SkipTestException("GStreamer backend was not found");
@@ -152,48 +208,54 @@ TEST(videoio_pos_frames_exact, gstreamer_real_file_seek_stays_honest_either_way)
 
     for (int target : {0, 5, 15, 62, 100})
     {
-        bool ok = cap.set(CAP_PROP_POS_FRAMES, target);
-        double exact = cap.get(CAP_PROP_POS_FRAMES_IS_EXACT);
-        // Checked before read(): GStreamer's own position reporting can become unavailable again after a subsequent read().
-        if (!ok)
-        {
-            // A failed seek must never claim to be exact.
-            EXPECT_NE(1, cvRound(exact)) << "target " << target;
-        }
-        else if (cvRound(exact) == 1)
-        {
-            EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << "target " << target;
-        }
-        if (ok)
-        {
-            Mat frame;
-            ASSERT_TRUE(cap.read(frame)) << "target " << target;
-        }
+        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+        EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << "target " << target;
+        EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
+        Mat frame;
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
     }
 }
 
-// Each encoded frame is a flat, distinct color so a decoded frame's content can be matched back
-// to its source index -- this is what lets gstreamer_read_after_seek_does_not_skip_the_landed_frame
-// below tell "read() returned the frame the seek landed on" apart from "read() returned the next one".
+static const int gstreamerGopFixtureFrameCount = 30;
+
+// Each encoded frame is a flat, distinct color.
 static Scalar gstreamerGopFixtureFrameColor(int i)
 {
     return Scalar(i * 5 % 256, (i * 7 + 30) % 256, (i * 11 + 60) % 256);
 }
 
-// A synthetic file with a real GOP structure (unlike the live pipelines above) so a non-key-frame seek can exercise decode-forward correction for real, not just stay honest about not verifying.
-static std::string generateGstreamerGopFixture()
+// Index of the closest frame in `reference`, a sequential decode by the same backend.
+static int nearestFrameIndex(const Mat& frame, const std::vector<Mat>& reference)
+{
+    int best = -1;
+    double bestDist = DBL_MAX;
+    for (size_t i = 0; i < reference.size(); i++)
+    {
+        double dist = cv::norm(frame, reference[i], NORM_L1);
+        if (dist < bestDist)
+        {
+            bestDist = dist;
+            best = (int)i;
+        }
+    }
+    return best;
+}
+
+// By default a file with a key frame every 12 frames, so most seek targets sit between key frames.
+static std::string generateGstreamerGopFixture(const std::string& x264Options = "key-int-max=12 bframes=0")
 {
     std::string path = cv::tempfile(".mp4");
-    std::string pipeline = "appsrc ! videoconvert ! x264enc key-int-max=12 bframes=0 ! qtmux ! filesink location=" + path;
+    std::string pipeline = "appsrc ! videoconvert ! x264enc " + x264Options + " ! h264parse ! qtmux ! filesink location=" + path;
     VideoWriter writer(pipeline, CAP_GSTREAMER, 0, 24.0, Size(64, 48), true);
     if (!writer.isOpened())
         return std::string();
-    for (int i = 0; i < 30; i++)
+    for (int i = 0; i < gstreamerGopFixtureFrameCount; i++)
         writer.write(Mat(48, 64, CV_8UC3, gstreamerGopFixtureFrameColor(i)));
     return path;
 }
 
-TEST(videoio_pos_frames_exact, gstreamer_decode_forward_corrects_at_least_one_landing)
+// Seeks back and forth on one capture must report the requested frame and read back its content.
+TEST(videoio_pos_frames_exact, gstreamer_seek_lands_on_the_requested_frame)
 {
     if (!videoio_registry::hasBackend(CAP_GSTREAMER))
         throw SkipTestException("GStreamer backend was not found");
@@ -202,87 +264,91 @@ TEST(videoio_pos_frames_exact, gstreamer_decode_forward_corrects_at_least_one_la
     if (path.empty())
         throw SkipTestException("GStreamer x264enc encoder was not available to build the test fixture");
 
-    int exactNonKeyFrameCount = 0;
-    for (int target : {1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19, 20, 22, 23})
+    std::vector<Mat> reference;
     {
-        // A fresh capture per target sidesteps a separate, unrelated issue where many consecutive seeks on one GStreamer capture can eventually stall.
         VideoCapture cap(path, CAP_GSTREAMER);
-        ASSERT_TRUE(cap.isOpened()) << "target " << target;
-        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
-        int exact = cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT));
-        int landed = cvRound(cap.get(CAP_PROP_POS_FRAMES));
-        if (exact == 1)
-        {
-            EXPECT_EQ(target, landed) << "target " << target;
-            exactNonKeyFrameCount++;
-        }
-        else
-        {
-            EXPECT_NE(target, landed) << "target " << target << ": landed exactly but wasn't reported as exact";
-        }
+        ASSERT_TRUE(cap.isOpened());
         Mat frame;
-        EXPECT_TRUE(cap.read(frame)) << "target " << target;
+        while (cap.read(frame))
+            reference.push_back(frame.clone());
     }
+    ASSERT_EQ((size_t)gstreamerGopFixtureFrameCount, reference.size());
 
-    EXPECT_GT(exactNonKeyFrameCount, 0)
-        << "decode-forward correction never landed exactly on any non-key-frame target across the sweep";
+    {
+        VideoCapture cap(path, CAP_GSTREAMER);
+        ASSERT_TRUE(cap.isOpened());
+
+        for (int target : {5, 2, 8, 4, 11, 19, 23, 1, 13, 0, 17, 22, 12})
+        {
+            ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+            EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << "target " << target;
+            EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
+
+            Mat frame;
+            ASSERT_TRUE(cap.read(frame)) << "target " << target;
+            EXPECT_EQ(target, nearestFrameIndex(frame, reference)) << "target " << target;
+        }
+    }
 
     remove(path.c_str());
 }
 
-// Regression test for a bug found while verifying this feature manually (not caught by either
-// GitHub review round, and not caught by the test above): correctPosFramesLanding()'s own
-// decode-forward loop grabs frames internally to walk up to the target, and the grab that lands
-// exactly on the target must be left for the caller's own read() to consume -- not silently
-// discarded. Before the fix, that landing grab's sample was thrown away and the *following*
-// grabFrame() call (i.e. the grab() half of the caller's read()) pulled a fresh sample one frame
-// past the target -- so read() silently returned the wrong frame's pixels while
-// CAP_PROP_POS_FRAMES_IS_EXACT still confidently reported 1. Checking only the reported position
-// (as every other test in this file does) can't see this bug: the position was reported correctly
-// the whole time, only the decoded pixel content was wrong. This test decodes the frame and checks
-// its actual color against the target index, not the index after it.
-TEST(videoio_pos_frames_exact, gstreamer_read_after_seek_does_not_skip_the_landed_frame)
+// Every frame, in shuffled order on one capture, must be exact and read back correctly.
+TEST(videoio_pos_frames_exact, gstreamer_seek_to_every_frame_is_exact)
 {
     if (!videoio_registry::hasBackend(CAP_GSTREAMER))
         throw SkipTestException("GStreamer backend was not found");
 
-    std::string path = generateGstreamerGopFixture();
+    for (const char* name : {"video/rotated_metadata.mp4", "video/big_buck_bunny.mp4"})
+    {
+        const std::string path = findDataFile(name);
+        std::vector<Mat> reference = readAllFrames(path, CAP_GSTREAMER, 200);
+        ASSERT_FALSE(reference.empty()) << name;
+
+        std::vector<int> targets(reference.size());
+        std::iota(targets.begin(), targets.end(), 0);
+        RNG rng(42);
+        randShuffle(targets, 1.0, &rng);
+
+        VideoCapture cap(path, CAP_GSTREAMER);
+        ASSERT_TRUE(cap.isOpened()) << name;
+        for (int target : targets)
+        {
+            ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << name << " target " << target;
+            EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << name << " target " << target;
+            EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << name << " target " << target;
+            Mat frame;
+            ASSERT_TRUE(cap.read(frame)) << name << " target " << target;
+            EXPECT_EQ(target, nearestFrameIndex(frame, reference)) << name << " target " << target;
+        }
+    }
+}
+
+// Open GOP decoding can yield corrupted frames; a seek that claims exact must still deliver the right frame.
+TEST(videoio_pos_frames_exact, gstreamer_open_gop_seek_does_not_claim_exact)
+{
+    if (!videoio_registry::hasBackend(CAP_GSTREAMER))
+        throw SkipTestException("GStreamer backend was not found");
+
+    std::string path = generateGstreamerGopFixture("key-int-max=12 bframes=3 option-string=open-gop=1");
     if (path.empty())
         throw SkipTestException("GStreamer x264enc encoder was not available to build the test fixture");
 
-    // Non-monotonic on purpose: an earlier seek priming the pipeline, then non-key-frame targets
-    // that require decode-forward, mirroring the real seek pattern the bug was originally found
-    // under (repeated seeks on one capture, not just a single isolated seek).
-    int targets[] = {5, 2, 8, 4, 11, 19, 23};
+    std::vector<Mat> reference = readAllFrames(path, CAP_GSTREAMER, gstreamerGopFixtureFrameCount);
+    ASSERT_EQ((size_t)gstreamerGopFixtureFrameCount, reference.size());
 
-    VideoCapture cap(path, CAP_GSTREAMER);
-    ASSERT_TRUE(cap.isOpened());
-
-    for (int target : targets)
+    for (int target = 0; target < gstreamerGopFixtureFrameCount; target++)
     {
-        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+        VideoCapture cap(path, CAP_GSTREAMER);
+        ASSERT_TRUE(cap.isOpened());
+        cap.set(CAP_PROP_POS_FRAMES, target);
         if (cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)) != 1)
-            continue; // only checking cases the backend itself claims are exact
-
+            continue;
         Mat frame;
         ASSERT_TRUE(cap.read(frame)) << "target " << target;
-
-        Scalar meanColor = mean(frame);
-        Scalar expected = gstreamerGopFixtureFrameColor(target);
-        Scalar nextFrameColor = gstreamerGopFixtureFrameColor(target + 1);
-
-        // The regression: a skipped frame lands much closer to target+1's color than target's.
-        double distToTarget = cv::norm(meanColor - expected, NORM_L1);
-        double distToNext = cv::norm(meanColor - nextFrameColor, NORM_L1);
-        EXPECT_LT(distToTarget, distToNext)
-            << "target " << target << ": read() returned frame " << (target + 1)
-            << "'s content instead of the frame the seek landed on (exact=1 was reported)";
-        EXPECT_LE(distToTarget, 15.0)
-            << "target " << target << ": decoded color too far from the expected flat color "
-            << "for this target frame (encoder noise budget)";
+        EXPECT_EQ(target, nearestFrameIndex(frame, reference)) << "target " << target;
     }
 
-    cap.release();
     remove(path.c_str());
 }
 

@@ -516,16 +516,13 @@ private:
     GstClockTime  readTimeout; // measured in nanoseconds
     bool          isPosFramesSupported;
     bool          isPosFramesEmulated;
-    // Set when correctPosFramesLanding()'s own verification grab already landed on the target frame and left it
-    // un-retrieved for the caller. The next grabFrame() call consumes this instead of pulling a new sample, so
-    // that set() + read() (the ordinary grab-then-retrieve pattern) doesn't skip past the frame the seek landed
-    // on. Cleared by retrieveFrame() and by any other seek that invalidates it -- see setProperty().
-    bool          posFramesPendingGrab;
     bool          vEOS;
     bool          aEOS;
     bool          syncLastFrame;
     bool          lastFrame;
     gint64        emulatedFrameNumber;
+    bool          seekLandedPending; // a CAP_PROP_POS_FRAMES seek happened and nothing was grabbed since
+    gint64        seekLandedFrame;   // the frame that seek prerolled, or -1 if it couldn't be told
     gint          outputAudioFormat;
     gint          audioBitPerSample;
     gint          audioBaseIndex;
@@ -569,12 +566,7 @@ protected:
     void restartPipeline();
     void setFilter(const char *prop, int type, int v1, int v2);
     void removeFilter(const char *filter);
-    // After a CAP_PROP_POS_FRAMES seek, decode forward (if needed and possible) to correct a landing that fell
-    // short of `target`. Owned here rather than the generic VideoCapture layer since only this backend's own
-    // key-frame seek can land short; leaves the pipeline paused when done, same as the seek itself, so position
-    // doesn't keep drifting before the caller's own read(). Uses this object's own grabFrame()/getProperty(),
-    // not the public IVideoCapture interface, so no cross-call state needs to leak into grabFrame() itself.
-    void correctPosFramesLanding(gint64 target);
+    bool seekToTimeAndGetFrame(gint64 ns, gint64& prerolledFrame);
 };
 
 GStreamerCapture::GStreamerCapture() :
@@ -595,12 +587,13 @@ GStreamerCapture::GStreamerCapture() :
     readTimeout(GSTREAMER_INTERRUPT_READ_DEFAULT_TIMEOUT_NS),
     isPosFramesSupported(false),
     isPosFramesEmulated(false),
-    posFramesPendingGrab(false),
     vEOS(false),
     aEOS(false),
     syncLastFrame(true),
     lastFrame(false),
     emulatedFrameNumber(-1),
+    seekLandedPending(false),
+    seekLandedFrame(-1),
     outputAudioFormat(CV_16S),
     audioBitPerSample(16),
     audioBaseIndex(1),
@@ -730,13 +723,7 @@ bool GStreamerCapture::grabFrame()
     if (!pipeline || !GST_IS_ELEMENT(pipeline.get()))
         return false;
 
-    // A seek's own verification already grabbed and is holding the target frame -- claim it instead of pulling
-    // a new sample, so this call (almost always the grab() half of the caller's read()) doesn't skip past it.
-    if (posFramesPendingGrab)
-    {
-        posFramesPendingGrab = false;
-        return true;
-    }
+    seekLandedPending = false;
 
     // start the pipeline if it was not in playing state yet
     if (!this->isPipelinePlaying())
@@ -1312,10 +1299,6 @@ bool GStreamerCapture::retrieveVideoFrame(int, OutputArray dst)
 
 bool GStreamerCapture::retrieveFrame(int index, OutputArray dst)
 {
-    // A caller retrieving directly (no intervening grab()) is claiming this pending frame themselves; either way,
-    // once a retrieve happens the pending-grab marker no longer applies to whatever comes next.
-    posFramesPendingGrab = false;
-
     if (index < 0)
         return false;
 
@@ -1407,6 +1390,7 @@ void GStreamerCapture::stopPipeline()
         CV_WARN("GStreamer: pipeline have not been created");
         return;
     }
+    seekLandedPending = false; // a stopped pipeline starts over, so the last seek result no longer applies
     if (gst_element_set_state(pipeline, GST_STATE_NULL) == GST_STATE_CHANGE_FAILURE)
     {
         CV_WARN("unable to stop pipeline");
@@ -2051,19 +2035,24 @@ double GStreamerCapture::getProperty(int propId) const
     case CAP_PROP_POS_MSEC:
         return double(timestamp) / GST_MSECOND;
     case CAP_PROP_POS_FRAMES:
+        if (seekLandedPending)
+            return seekLandedFrame >= 0 ? (double)seekLandedFrame : (double)CAP_PROP_UNKNOWN;
         if (!isPosFramesSupported)
         {
             if (isPosFramesEmulated)
                 return emulatedFrameNumber;
             return CAP_PROP_UNKNOWN;
         }
-        format = GST_FORMAT_DEFAULT;
+        // The GST_FORMAT_DEFAULT query truncates n / fps back to n - 1, so round the time position instead.
+        format = fps > 0 ? GST_FORMAT_TIME : GST_FORMAT_DEFAULT;
         status = gst_element_query_position(sink.get(), CV_GST_FORMAT(format), &value);
         if(!status) {
             handleMessage(pipeline);
             CV_WARN("GStreamer: unable to query position of stream");
             return CAP_PROP_UNKNOWN;
         }
+        if (format == GST_FORMAT_TIME)
+            return (double)(gint64)((double)value * fps / GST_SECOND + 0.5);
         return value;
     case CAP_PROP_POS_AVI_RATIO:
         format = GST_FORMAT_PERCENT;
@@ -2174,13 +2163,11 @@ bool GStreamerCapture::setProperty(int propId, double value)
         }
         else
         {
-            // Nothing else clears vEOS/aEOS, so a prior full read-through would otherwise permanently block
-            // grabFrame() after every future seek -- same fix as CAP_PROP_POS_FRAMES below, same root cause.
+            // Nothing else clears the EOS flags, so after reading to the end every later grabFrame() would fail.
             vEOS = false;
             aEOS = false;
             lastFrame = false;
-            // A flushing seek invalidates any sample a prior CAP_PROP_POS_FRAMES seek left pending.
-            posFramesPendingGrab = false;
+            seekLandedPending = false;
 
             // Optimistically caching the target timestamp before reading the first frame from the new position since
             // the timestamp in GStreamer can be reliable extracted from the read frames.
@@ -2216,34 +2203,47 @@ bool GStreamerCapture::setProperty(int propId, double value)
             CV_WARN("unable to seek");
             return false;
         }
-        // Get off PLAYING before seeking (some mov/mp4 files seek incorrectly otherwise), but pause rather than stopPipeline()'s full GST_STATE_NULL, which tears down negotiation and breaks every seek after the first.
+        // Pause rather than stop before seeking: GST_STATE_NULL drops caps negotiation and breaks later seeks.
         if (this->isPipelinePlaying())
         {
-            if (gst_element_set_state(pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE)
+            if (gst_element_set_state(pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE ||
+                gst_element_get_state(pipeline, NULL, NULL, readTimeout) == GST_STATE_CHANGE_ASYNC)
             {
                 handleMessage(pipeline);
                 CV_WARN("GStreamer: unable to pause pipeline before seeking");
                 return false;
             }
-            gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
         }
 
-        if(!gst_element_seek_simple(GST_ELEMENT(pipeline.get()), GST_FORMAT_DEFAULT,
-                                    flags, (gint64) value)) {
-            handleMessage(pipeline);
-            CV_WARN("GStreamer: unable to seek");
-            return false;
+        seekLandedPending = false;
+        if (fps > 0)
+        {
+            // Seek to mid-frame (safe from rounding); if that skipped to the next key frame, retry at the exact start.
+            const gint64 target = (gint64)value;
+            gint64 landed = -1;
+            if (!seekToTimeAndGetFrame((gint64)((target + 0.5) * GST_SECOND / fps), landed))
+                return false;
+            if (landed == target + 1 &&
+                !seekToTimeAndGetFrame((gint64)(target * GST_SECOND / fps), landed))
+                return false;
+            seekLandedFrame = landed;
+            seekLandedPending = true;
         }
-        // wait for status update
-        gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
-        // Nothing else clears vEOS/aEOS, so a prior full read-through would otherwise permanently block grabFrame() after every future seek.
+        else
+        {
+            if(!gst_element_seek_simple(GST_ELEMENT(pipeline.get()), GST_FORMAT_DEFAULT,
+                                        flags, (gint64) value)) {
+                handleMessage(pipeline);
+                CV_WARN("GStreamer: unable to seek");
+                return false;
+            }
+            // wait for status update
+            gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
+        }
+        // Nothing else clears the EOS flags, so after reading to the end every later grabFrame() would fail.
         vEOS = false;
         aEOS = false;
         lastFrame = false;
-
-        // A key-frame seek can land short of the requested frame; decode forward to correct it. This is owned
-        // here (rather than the generic VideoCapture layer) since this backend controls its own pipeline state.
-        correctPosFramesLanding((gint64) value);
         return true;
     }
     case CAP_PROP_POS_AVI_RATIO:
@@ -2259,11 +2259,11 @@ bool GStreamerCapture::setProperty(int propId, double value)
         }
         else
         {
-            // Same fix, same root cause as CAP_PROP_POS_MSEC/CAP_PROP_POS_FRAMES above.
+            // Nothing else clears the EOS flags, so after reading to the end every later grabFrame() would fail.
             vEOS = false;
             aEOS = false;
             lastFrame = false;
-            posFramesPendingGrab = false;
+            seekLandedPending = false;
 
             if (isPosFramesEmulated)
             {
@@ -2374,55 +2374,35 @@ bool GStreamerCapture::setProperty(int propId, double value)
     return false;
 }
 
-// After a CAP_PROP_POS_FRAMES seek, decode forward (if needed and possible) to correct a landing that fell
-// short of `target`. No-op if the seek already landed on or past `target`, or if position can't be verified
-// or chased (unbounded/live source). Leaves the pipeline paused when it returns, matching the state the seek
-// itself left it in, so position doesn't keep drifting in the background before the caller's own read().
-//
-// The verification grabs below necessarily consume frames -- that's how decode-forward works. But the LAST one
-// (the one that lands on `target`) must not be silently discarded: it's left un-retrieved, and posFramesPendingGrab
-// marks it so the next grabFrame() call (almost always the grab() half of the caller's own read()) claims it
-// instead of pulling a new sample. Without this, set() + read() -- the ordinary way to use this feature -- would
-// skip past the very frame the seek just landed on.
-void GStreamerCapture::correctPosFramesLanding(gint64 target)
+
+// Accurate seek to `ns`, then read the prerolled frame's index (-1 if unknown); the preroll stays queued.
+bool GStreamerCapture::seekToTimeAndGetFrame(gint64 ns, gint64& prerolledFrame)
 {
-    posFramesPendingGrab = false;
-
-    if (duration <= 0) // unbounded/live source: no reliable target to chase, accept wherever the seek landed
-        return;
-
-    if (target > duration) // beyond EOF: don't run the pipeline to exhaustion chasing a frame that doesn't exist
-        return;
-
-    double landedD = this->getProperty(CAP_PROP_POS_FRAMES);
-    if (landedD == static_cast<double>(CAP_PROP_UNKNOWN))
-        return; // can't verify without risking a grab that discards the frame the seek landed on
-
-    gint64 landed = static_cast<gint64>(landedD);
-    bool grabbedAny = false;      // pipeline may have been resumed to PLAYING and needs re-pausing
-    bool haveFreshSample = false; // a successfully-grabbed, unretrieved sample is now pending
-    while (landed < target)
+    prerolledFrame = -1;
+    if (!gst_element_seek_simple(GST_ELEMENT(pipeline.get()), GST_FORMAT_TIME,
+                                 (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE), ns))
     {
-        if (!this->grabFrame())
-        {
-            grabbedAny = true;
-            break; // ran out of frames before reaching the target
-        }
-        grabbedAny = true;
-        haveFreshSample = true;
-        double nextD = this->getProperty(CAP_PROP_POS_FRAMES);
-        if (nextD == static_cast<double>(CAP_PROP_UNKNOWN) || static_cast<gint64>(nextD) <= landed)
-            break; // position reporting became unreliable/non-monotonic mid-decode; stop rather than loop forever
-        landed = static_cast<gint64>(nextD);
+        handleMessage(pipeline);
+        CV_WARN("GStreamer: unable to seek");
+        return false;
     }
+    gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
 
-    posFramesPendingGrab = haveFreshSample;
+    GSafePtr<GstSample> preroll;
+    preroll.attach(gst_app_sink_try_pull_preroll(GST_APP_SINK(sink.get()), readTimeout));
+    GstBuffer* buf = preroll ? gst_sample_get_buffer(preroll) : NULL;
+    const GstSegment* segment = preroll ? gst_sample_get_segment(preroll) : NULL;
+    if (!buf || !segment || !GST_BUFFER_PTS_IS_VALID(buf))
+        return true;
+    // A corrupted picture (e.g. decoding started inside an open GOP) is not the requested frame.
+    if (GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_CORRUPTED))
+        return true;
 
-    if (grabbedAny && this->isPipelinePlaying())
-    {
-        gst_element_set_state(pipeline, GST_STATE_PAUSED);
-        gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
-    }
+    // Stream time starts frame 0 at zero; a clipped timestamp falls inside its frame, so round down.
+    guint64 streamTime = gst_segment_to_stream_time(segment, GST_FORMAT_TIME, GST_BUFFER_PTS(buf));
+    if (GST_CLOCK_TIME_IS_VALID(streamTime))
+        prerolledFrame = (gint64)std::floor((double)streamTime * fps / GST_SECOND + 0.25);
+    return true;
 }
 
 Ptr<IVideoCapture> createGStreamerCapture_file(const String& filename, const cv::VideoCaptureParameters& params)

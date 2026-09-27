@@ -532,6 +532,9 @@ struct CvCapture_FFMPEG
 
     void    seek(int64_t frame_number);
     void    seek(double sec);
+    void    seekToFrameTime(int64_t frame_idx);
+    bool    seekToStart(int method);
+    bool    rewindToFirstFrame(int& method);
     bool    slowSeek( int framenumber );
 
     int64_t get_total_frames() const;
@@ -566,6 +569,8 @@ struct CvCapture_FFMPEG
     struct SwsContext *img_convert_ctx;
 
     int64_t frame_number, first_frame_number;
+    int64_t first_frame_pts; // picture_pts of the first decoded frame, used to check a rewind really got there
+    bool    frame_number_unknown; // the last seek could not verify where it landed
 
     int    rotation_angle; // valid 0, 90, 180, 270
     double eps_zero;
@@ -624,6 +629,8 @@ void CvCapture_FFMPEG::init()
     ts_offset_avtb = 0;
     ts_offset_decided = false;
     first_frame_number = -1;
+    first_frame_pts = AV_NOPTS_VALUE_;
+    frame_number_unknown = false;
     memset( &rgb_picture, 0, sizeof(rgb_picture) );
     memset( &frame, 0, sizeof(frame) );
     filename = 0;
@@ -1809,7 +1816,10 @@ bool CvCapture_FFMPEG::grabFrame()
     }
 
     if (valid && first_frame_number < 0)
+    {
         first_frame_number = dts_to_frame_number(picture_pts);
+        first_frame_pts = picture_pts;
+    }
 
 #if USE_AV_INTERRUPT_CALLBACK
     // deactivate interrupt callback
@@ -2098,7 +2108,7 @@ double CvCapture_FFMPEG::getProperty( int property_id ) const
         }
         return (dts_to_sec(picture_pts) * 1000);
     case CAP_PROP_POS_FRAMES:
-        return (double)frame_number;
+        return frame_number_unknown ? -1 : (double)frame_number;
     case CAP_PROP_POS_AVI_RATIO:
         return r2d(ic->streams[video_stream]->time_base);
     case CAP_PROP_FRAME_COUNT:
@@ -2288,83 +2298,157 @@ void CvCapture_FFMPEG::get_rotation_angle()
 #endif
 }
 
+// Some decoders (e.g. Sorenson svq1) mark intra frames only through pict_type, not the key frame flag.
+static bool isKeyFrame(const AVFrame* f)
+{
+#ifdef AV_FRAME_FLAG_KEY
+    if (f->flags & AV_FRAME_FLAG_KEY)
+        return true;
+#else
+    if (f->key_frame)
+        return true;
+#endif
+    return f->pict_type == AV_PICTURE_TYPE_I;
+}
+
+// Timestamp seek to the key frame at or before `frame_idx`, assuming frame i is shown at i / fps.
+void CvCapture_FFMPEG::seekToFrameTime(int64_t frame_idx)
+{
+    AVStream* st = ic->streams[video_stream];
+    double sec = (double)frame_idx / get_fps();
+    int64_t time_stamp = st->start_time != AV_NOPTS_VALUE_ ? st->start_time : 0;
+    int64_t ts_norm = (int64_t)(sec / r2d(st->time_base) + 0.5);
+
+    if (ts_offset_avtb != 0) {
+        // map normalized target back to original demux timeline
+        time_stamp += ts_norm - from_avtb(ts_offset_avtb, st->time_base);
+    } else {
+        time_stamp += ts_norm;
+    }
+
+    if (get_total_frames() > 1) av_seek_frame(ic, video_stream, time_stamp, AVSEEK_FLAG_BACKWARD);
+    if (!rawMode)
+        avcodec_flush_buffers(context);
+}
+
+// method 0: timestamp seek to the first frame's own timestamp; method 1: byte seek to the start of the file.
+bool CvCapture_FFMPEG::seekToStart(int method)
+{
+    int err;
+    if (method == 0)
+    {
+        AVStream* st = ic->streams[video_stream];
+        int64_t ts = first_frame_pts;
+        if (ts_offset_avtb != 0) // back from the normalized timeline to the demuxer's
+            ts = from_avtb(to_avtb(ts, st->time_base) - ts_offset_avtb, st->time_base);
+        err = av_seek_frame(ic, video_stream, ts, AVSEEK_FLAG_BACKWARD);
+    }
+    else
+    {
+        if (ic->iformat->flags & AVFMT_NO_BYTE_SEEK)
+            return false;
+        err = av_seek_frame(ic, video_stream, 0, AVSEEK_FLAG_BYTE);
+    }
+    avcodec_flush_buffers(context);
+    return err >= 0;
+}
+
+// Seek to frame 0 and verify it by key flag and first timestamp; on success `method` is the seek that worked.
+bool CvCapture_FFMPEG::rewindToFirstFrame(int& method)
+{
+    if (first_frame_pts == AV_NOPTS_VALUE_ || get_total_frames() <= 1)
+        return false;
+    for (method = 0; method < 2; method++)
+    {
+        if (!seekToStart(method))
+            continue;
+        frame_number = 0;
+        if (grabFrame() && picture_pts == first_frame_pts && isKeyFrame(picture))
+            return true;
+    }
+    return false;
+}
+
 void CvCapture_FFMPEG::seek(int64_t _frame_number)
 {
     if (!rawMode) {
         CV_Assert(context);
     }
     _frame_number = std::min(_frame_number, get_total_frames());
-    int delta = !rawMode ? 16 : 0;
+    frame_number_unknown = false;
 
     // if we have not grabbed a single frame before first seek, let's read the first frame
     // and get some valuable information during the process
     if( first_frame_number < 0 && get_total_frames() > 1 )
         grabFrame();
 
-    for(;;)
+    if (rawMode)
     {
-        int64_t _frame_number_temp = std::max(_frame_number-delta, (int64_t)0);
-        double sec = (double)_frame_number_temp / get_fps();
-
-        AVStream* st = ic->streams[video_stream];
-        int64_t time_stamp = st->start_time;
-        if (time_stamp == AV_NOPTS_VALUE_)  // same guard as dts_to_sec(): without it the target is INT64_MIN + offset,
-            time_stamp = 0;                 // av_seek_frame() lands at position 0 and the loop below decodes every frame
-        double  time_base  = r2d(st->time_base);
-        int64_t ts_norm = (int64_t)(sec / time_base + 0.5);
-
-        if (ts_offset_avtb != 0) {
-            // map normalized target back to original demux timeline
-            time_stamp += ts_norm - from_avtb(ts_offset_avtb, st->time_base);
-        } else {
-            time_stamp += ts_norm;
-        }
-
-        if (get_total_frames() > 1) av_seek_frame(ic, video_stream, time_stamp, AVSEEK_FLAG_BACKWARD);
-        if(!rawMode)
-            avcodec_flush_buffers(context);
-        if( _frame_number > 0 )
+        // RAW mode stops at the key frame at or before the target (see CAP_PROP_POS_FRAMES).
+        seekToFrameTime(_frame_number);
+        if (_frame_number > 1)
         {
             grabFrame();
-
-            if( _frame_number > 1 )
-            {
-                frame_number = dts_to_frame_number(picture_pts) - first_frame_number;
-                if (rawMode) {
-                    rawSeek = true;
-                    break;
-                }
-                //printf("_frame_number = %d, frame_number = %d, delta = %d\n",
-                //       (int)_frame_number, (int)frame_number, delta);
-
-                if( frame_number < 0 || frame_number > _frame_number-1 )
-                {
-                    if( _frame_number_temp == 0 || delta >= INT_MAX/4 )
-                        break;
-                    delta = delta < 16 ? delta*2 : delta*3/2;
-                    continue;
-                }
-                while( frame_number < _frame_number-1 )
-                {
-                    if(!grabFrame())
-                        break;
-                }
-                frame_number++;
-                break;
-            }
-            else
-            {
-                frame_number = 1;
-                break;
-            }
+            frame_number = dts_to_frame_number(picture_pts) - first_frame_number;
+            rawSeek = true;
+        }
+        else if (_frame_number == 1)
+        {
+            grabFrame();
+            frame_number = 1;
         }
         else
         {
             frame_number = 0;
             picture_pts = AV_NOPTS_VALUE_;
-            break;
         }
+        return;
     }
+
+    // Trust a seek only if it lands on a key frame at or before the target, then count up; else back off.
+    int64_t delta = 16;
+    for (;;)
+    {
+        int64_t from = _frame_number - delta;
+        if (from <= 0)
+            break;
+        seekToFrameTime(from);
+        if (grabFrame() && picture_pts != AV_NOPTS_VALUE_ && isKeyFrame(picture))
+        {
+            int64_t landed = dts_to_frame_number(picture_pts) - first_frame_number;
+            if (landed >= 0 && landed < _frame_number)
+            {
+                frame_number = landed + 1;
+                while (frame_number < _frame_number && grabFrame())
+                    ;
+                return;
+            }
+        }
+        delta = delta * 3 / 2;
+    }
+
+    int method = 0;
+    if (!rewindToFirstFrame(method))
+    {
+        // The start can't be verified: count from it anyway, but report unknown if a real seek was attempted.
+        seekToFrameTime(0);
+        frame_number = 0;
+        frame_number_unknown = get_total_frames() > 1;
+        picture_pts = AV_NOPTS_VALUE_;
+        while (frame_number < _frame_number && grabFrame())
+            ;
+        return;
+    }
+    if (_frame_number == 0)
+    {
+        // Frame 0 was decoded to check the rewind; seek there again so that the next read() returns it.
+        seekToStart(method);
+        frame_number = 0;
+        picture_pts = AV_NOPTS_VALUE_;
+        return;
+    }
+    while (frame_number < _frame_number && grabFrame())
+        ;
 }
 
 void CvCapture_FFMPEG::seek(double sec)

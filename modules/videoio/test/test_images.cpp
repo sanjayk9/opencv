@@ -208,9 +208,34 @@ TEST(videoio_images, seek_pos_frames_is_exact)
         EXPECT_EQ(1, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
     }
 
-    // Genuinely out-of-range: decoding forward runs out of frames before reaching the target.
-    cap.set(CAP_PROP_POS_FRAMES, count + 100);
+    // Out of range: the backend clamps to the last image, which is short of the target.
+    EXPECT_TRUE(cap.set(CAP_PROP_POS_FRAMES, count + 100));
+    EXPECT_EQ(count - 1, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES)));
     EXPECT_EQ(0, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+}
+
+TEST(videoio_images, seek_pos_frames_fraction_and_negative)
+{
+    // Fractional targets round down; negative ones mean the first image.
+    const int count = 5;
+    ImageCollection col;
+    col.generate(count);
+    VideoCapture cap(col.getFirstFilename(), CAP_IMAGES);
+    ASSERT_TRUE(cap.isOpened());
+
+    const struct { double target; int expected; } cases[] = {
+        {2.4, 2}, {2.5, 2}, {2.6, 2}, {3.5, 3}, {count - 0.1, count - 1}, {-0.4, 0}, {-1, 0}, {-100, 0}
+    };
+    for (const auto& c : cases)
+    {
+        SCOPED_TRACE(cv::format("target=%g", c.target));
+        EXPECT_TRUE(cap.set(CAP_PROP_POS_FRAMES, c.target));
+        EXPECT_EQ(c.expected, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES)));
+        EXPECT_EQ(1, static_cast<int>(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+        Mat img;
+        ASSERT_TRUE(cap.read(img));
+        EXPECT_MAT_N_DIFF(img, col.getFrame(c.expected), 0);
+    }
 }
 
 TEST(videoio_images, release_resets_pos_frames_is_exact)
