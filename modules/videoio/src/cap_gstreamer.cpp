@@ -567,6 +567,7 @@ protected:
     void setFilter(const char *prop, int type, int v1, int v2);
     void removeFilter(const char *filter);
     bool seekToTimeAndGetFrame(gint64 ns, gint64& prerolledFrame);
+    void resetEndOfStream();
 };
 
 GStreamerCapture::GStreamerCapture() :
@@ -2163,10 +2164,7 @@ bool GStreamerCapture::setProperty(int propId, double value)
         }
         else
         {
-            // Nothing else clears the EOS flags, so after reading to the end every later grabFrame() would fail.
-            vEOS = false;
-            aEOS = false;
-            lastFrame = false;
+            resetEndOfStream();
             seekLandedPending = false;
 
             // Optimistically caching the target timestamp before reading the first frame from the new position since
@@ -2203,7 +2201,7 @@ bool GStreamerCapture::setProperty(int propId, double value)
             CV_WARN("unable to seek");
             return false;
         }
-        // Pause rather than stop before seeking: GST_STATE_NULL drops caps negotiation and breaks later seeks.
+        // Seeks need a PAUSED pipeline: it accepts the seek and holds the landed frame as the preroll until grabFrame() resumes playback.
         if (this->isPipelinePlaying())
         {
             if (gst_element_set_state(pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE ||
@@ -2240,10 +2238,7 @@ bool GStreamerCapture::setProperty(int propId, double value)
             // wait for status update
             gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
         }
-        // Nothing else clears the EOS flags, so after reading to the end every later grabFrame() would fail.
-        vEOS = false;
-        aEOS = false;
-        lastFrame = false;
+        resetEndOfStream();
         return true;
     }
     case CAP_PROP_POS_AVI_RATIO:
@@ -2259,10 +2254,7 @@ bool GStreamerCapture::setProperty(int propId, double value)
         }
         else
         {
-            // Nothing else clears the EOS flags, so after reading to the end every later grabFrame() would fail.
-            vEOS = false;
-            aEOS = false;
-            lastFrame = false;
+            resetEndOfStream();
             seekLandedPending = false;
 
             if (isPosFramesEmulated)
@@ -2398,11 +2390,19 @@ bool GStreamerCapture::seekToTimeAndGetFrame(gint64 ns, gint64& prerolledFrame)
     if (GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_CORRUPTED))
         return true;
 
-    // Stream time starts frame 0 at zero; a clipped timestamp falls inside its frame, so round down.
+    // Frame n starts at n / fps (a clipped one lies inside); +0.25 rounds up anything within a quarter frame below a start, absorbing ns truncation.
     guint64 streamTime = gst_segment_to_stream_time(segment, GST_FORMAT_TIME, GST_BUFFER_PTS(buf));
     if (GST_CLOCK_TIME_IS_VALID(streamTime))
         prerolledFrame = (gint64)std::floor((double)streamTime * fps / GST_SECOND + 0.25);
     return true;
+}
+
+// A seek leaves the end of the stream, so the EOS state must not carry over to the next grabFrame().
+void GStreamerCapture::resetEndOfStream()
+{
+    vEOS = false;
+    aEOS = false;
+    lastFrame = false;
 }
 
 Ptr<IVideoCapture> createGStreamerCapture_file(const String& filename, const cv::VideoCaptureParameters& params)

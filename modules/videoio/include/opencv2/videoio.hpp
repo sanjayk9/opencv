@@ -205,7 +205,7 @@ enum VideoCaptureProperties {
        CAP_PROP_PTS = 71, //!<  (read-only) FFmpeg back-end only - presentation timestamp of the most recently read frame using the FPS time base.  e.g. fps = 25, VideoCapture::get(\ref CAP_PROP_PTS) = 3, presentation time = 3/25 seconds.
        CAP_PROP_DTS_DELAY = 72, //!<  (read-only) FFmpeg back-end only - maximum difference between presentation (pts) and decompression timestamps (dts) using FPS time base.  e.g. delay is maximum when frame_num = 0, if true, VideoCapture::get(\ref CAP_PROP_PTS) = 0 and VideoCapture::get(\ref CAP_PROP_DTS_DELAY) = 2, dts = -2.  Non zero values usually imply the stream is encoded using B-frames which are not decoded in presentation order.
        CAP_PROP_IMAGE_SEQ_START = 73, //!< (**open-only**) Start number for image sequences opened with a printf-style pattern (e.g. `frame_%05d.dpx`). Sets the initial frame number and disables automatic first-frame detection. Applicable to \ref CAP_FFMPEG (passed as the image2 demuxer `start_number`) and \ref CAP_IMAGES backends. Default: not set (automatic detection).
-       CAP_PROP_POS_FRAMES_IS_EXACT = 74, //!< (read-only) Whether the last #CAP_PROP_POS_FRAMES seek landed exactly on the requested frame: `1` exact, `0` landed on a different frame, `-1` unknown (no seek yet, or the backend cannot report where it landed).
+       CAP_PROP_POS_FRAMES_IS_EXACT = 74, //!< (read-only) Whether the last #CAP_PROP_POS_FRAMES seek landed exactly on the requested frame: `1` exact, `0` landed on a different frame, `-1` unknown (no seek yet, a later #CAP_PROP_POS_MSEC or #CAP_PROP_POS_AVI_RATIO seek, or the backend cannot report where it landed).
 #ifndef CV_DOXYGEN
        CV__CAP_PROP_LATEST
 #endif
@@ -1081,9 +1081,6 @@ protected:
 
     // Exactness of the most recent CAP_PROP_POS_FRAMES seek, queried via get(CAP_PROP_POS_FRAMES_IS_EXACT).
     int lastPosFramesSeekExactness = -1;
-
-    // Seeks through the backend, then records in lastPosFramesSeekExactness whether it landed on `value`.
-    bool seekPosFramesExact(double value);
 
     friend class internal::VideoCapturePrivateAccessor;
 };

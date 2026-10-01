@@ -600,28 +600,23 @@ VideoCapture& VideoCapture::operator >> (UMat& image)
     return *this;
 }
 
-// The backend does the seek; here we only read the position back and record whether it hit the target.
-bool VideoCapture::seekPosFramesExact(double value)
+// The backend does the seek; here we only read the position back and record in `exactness` whether it hit the target.
+static bool seekPosFramesExact(IVideoCapture& cap, double value, int& exactness)
 {
-    lastPosFramesSeekExactness = -1;
+    exactness = -1;
 
     // Treat a negative target as frame 0 before the backend sees it.
     value = std::max(value, 0.0);
 
-    if (!icap->setProperty(CAP_PROP_POS_FRAMES, value))
+    if (!cap.setProperty(CAP_PROP_POS_FRAMES, value))
         return false;
 
-    // XINE and AVFoundation report the requested position back, so a read-back proves nothing.
-    const int api = icap->getCaptureDomain();
-    if (api == CAP_XINE || api == CAP_AVFOUNDATION)
-        return true;
-
-    const double landed = icap->getProperty(CAP_PROP_POS_FRAMES);
+    const double landed = cap.getProperty(CAP_PROP_POS_FRAMES);
     if (landed == static_cast<double>(CAP_PROP_UNKNOWN))
         return true;
 
     const double target = std::floor(value);
-    lastPosFramesSeekExactness = (landed == target) ? 1 : 0;
+    exactness = (landed == target) ? 1 : 0;
 
     // Landing short of the target is approximate; landing past it skips frames, so it is a failed seek.
     return landed <= target;
@@ -633,7 +628,17 @@ bool VideoCapture::set(int propId, double value)
     bool ret = false;
     if (!icap.empty())
     {
-        ret = (propId == CAP_PROP_POS_FRAMES) ? seekPosFramesExact(value) : icap->setProperty(propId, value);
+        if (propId == CAP_PROP_POS_FRAMES)
+        {
+            ret = seekPosFramesExact(*icap, value, lastPosFramesSeekExactness);
+        }
+        else
+        {
+            ret = icap->setProperty(propId, value);
+            // A seek by time or ratio moves the position too, so the last POS_FRAMES verdict no longer holds.
+            if (propId == CAP_PROP_POS_MSEC || propId == CAP_PROP_POS_AVI_RATIO)
+                lastPosFramesSeekExactness = -1;
+        }
     }
     if (!ret && throwOnFail)
     {
