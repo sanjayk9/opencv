@@ -41,6 +41,8 @@
 
 #include "precomp.hpp"
 
+#include <cmath>
+
 #include "opencv2/videoio/registry.hpp"
 #include "videoio_registry.hpp"
 
@@ -519,6 +521,7 @@ void VideoCapture::release()
 {
     CV_TRACE_FUNCTION();
     icap.release();
+    lastPosFramesSeekExactness = -1;
 }
 
 bool VideoCapture::grab()
@@ -597,10 +600,46 @@ VideoCapture& VideoCapture::operator >> (UMat& image)
     return *this;
 }
 
+// The backend does the seek; here we only read the position back and record in `exactness` whether it hit the target.
+static bool seekPosFramesExact(IVideoCapture& cap, double value, int& exactness)
+{
+    exactness = -1;
+
+    // Treat a negative target as frame 0 before the backend sees it.
+    value = std::max(value, 0.0);
+
+    if (!cap.setProperty(CAP_PROP_POS_FRAMES, value))
+        return false;
+
+    const double landed = cap.getProperty(CAP_PROP_POS_FRAMES);
+    if (landed == static_cast<double>(CAP_PROP_UNKNOWN))
+        return true;
+
+    const double target = std::floor(value);
+    exactness = (landed == target) ? 1 : 0;
+
+    // Landing short of the target is approximate; landing past it skips frames, so it is a failed seek.
+    return landed <= target;
+}
+
 bool VideoCapture::set(int propId, double value)
 {
     CV_CheckNE(propId, (int)CAP_PROP_BACKEND, "Can't set read-only property");
-    bool ret = !icap.empty() ? icap->setProperty(propId, value) : false;
+    bool ret = false;
+    if (!icap.empty())
+    {
+        if (propId == CAP_PROP_POS_FRAMES)
+        {
+            ret = seekPosFramesExact(*icap, value, lastPosFramesSeekExactness);
+        }
+        else
+        {
+            ret = icap->setProperty(propId, value);
+            // A seek by time or ratio moves the position too, so the last POS_FRAMES verdict no longer holds.
+            if (propId == CAP_PROP_POS_MSEC || propId == CAP_PROP_POS_AVI_RATIO)
+                lastPosFramesSeekExactness = -1;
+        }
+    }
     if (!ret && throwOnFail)
     {
         CV_Error_(Error::StsError, ("could not set prop %d = %f", propId, value));
@@ -622,6 +661,10 @@ double VideoCapture::get(int propId) const
             return CAP_PROP_UNKNOWN;
         }
         return static_cast<double>(api);
+    }
+    if (propId == CAP_PROP_POS_FRAMES_IS_EXACT)
+    {
+        return static_cast<double>(lastPosFramesSeekExactness);
     }
     return !icap.empty() ? icap->getProperty(propId) : static_cast<double>(CAP_PROP_UNKNOWN);
 }
