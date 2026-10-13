@@ -969,7 +969,7 @@ bool  TiffDecoder::readData( Mat& img )
                                         if (m_use_rgb)
                                             std::memcpy( (void*) img_line_buffer,
                                                          (void*) bstart,
-                                                         tile_width * sizeof(uchar) );
+                                                         tile_width * ncn * sizeof(uchar) );
                                         else
                                             icvCvt_BGR2RGB_8u_C3R( bstart, 0,
                                                     img_line_buffer, 0,
@@ -1079,7 +1079,7 @@ bool  TiffDecoder::readData( Mat& img )
                                     {
                                         CV_CheckEQ(wanted_channels, 3, "");
                                         if (m_use_rgb)
-                                            std::memcpy(buffer16, img.ptr<ushort>(img_y + i, x), tile_width * sizeof(ushort));
+                                            std::memcpy(img.ptr<ushort>(img_y + i, x), buffer16, tile_width * ncn * sizeof(ushort));
                                         else
                                             icvCvt_RGB2BGR_16u_C3R(buffer16, 0,
                                                     img.ptr<ushort>(img_y + i, x), 0,
@@ -1370,6 +1370,23 @@ bool TiffEncoder::writeLibTiff( const std::vector<Mat>& img_vec, const std::vect
                 CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_TIFF_COMPRESSION must be one of ImwriteTiffCompressionFlags. It is fallbacked to IMWRITE_TIFF_COMPRESSION_LZW", compression));
                 compression = IMWRITE_TIFF_COMPRESSION_LZW;
                 break;
+        }
+
+        if (!TIFFIsCODECConfigured(static_cast<uint16_t>(compression)))
+        {
+            // this compression schema is not available with using libtiff.
+            if (TIFFIsCODECConfigured(static_cast<uint16_t>(IMWRITE_TIFF_COMPRESSION_LZW)))
+            {
+                // use LZW instead of specified compression schema.
+                CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_TIFF_COMPRESSION is not available, It is fallbacked to IMWRITE_TIFF_COMPRESSION_LZW", compression));
+                compression = IMWRITE_TIFF_COMPRESSION_LZW;
+            }
+            else
+            {
+                // use NONE instead of LZW which is not available too.
+                CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_TIFF_COMPRESSION is not available, It is fallbacked to IMWRITE_TIFF_COMPRESSION_NONE", compression));
+                compression = IMWRITE_TIFF_COMPRESSION_NONE;
+            }
         }
     }
     if(readParam(params, IMWRITE_TIFF_PREDICTOR, predictor))

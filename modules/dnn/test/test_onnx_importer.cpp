@@ -184,6 +184,10 @@ public:
 
         if (useSoftmax)
         {
+            // An fp16 model hands back an fp16 blob; the Softmax net below is float-only.
+            if (out.depth() == CV_16F || out.depth() == CV_16BF)
+                out.convertTo(out, CV_32F);
+
             LayerParams lp;
             Net netSoftmax;
             netSoftmax.addLayerToPrev("softmaxLayer", "Softmax", lp);
@@ -427,6 +431,9 @@ TEST_P(Test_ONNX_layers, Deconvolution)
     testONNXModels("deconvolution_output_shape", npy, 0, 0, false, false);
     if (target != DNN_TARGET_CUDA_FP16) // bug
         testONNXModels("deconv_adjpad_2d", npy, 0, 0, false, false);
+    // out_channels == C0, so NK1 == 1: exercises computeSpatChunks()'s spatial
+    // split in conv2_deconv.cpp regardless of thread count.
+    testONNXModels("deconv_spatial_narrow", npy, 0, 0, false, false);
 }
 
 TEST_P(Test_ONNX_layers, Deconvolution3D)
@@ -1468,6 +1475,14 @@ TEST_P(Test_ONNX_layers, Softmax)
     testONNXModels("softmax");
     testONNXModels("log_softmax", npy, 0, 0, false, false);
     testONNXModels("softmax_unfused");
+
+    // Before opset 13 the operator coerces its input to 2D and reduces the flattened
+    // dims [axis, rank), which the CPU path implements.
+    if (backend == DNN_BACKEND_OPENCV && target == DNN_TARGET_CPU)
+    {
+        testONNXModels("softmax_axis_1_opset11");
+        testONNXModels("log_softmax_axis_0_opset11");
+    }
 }
 
 TEST_P(Test_ONNX_layers, Split_EltwiseMax)
@@ -3051,6 +3066,13 @@ void yoloPostProcessing(
     std::vector<float> confidences;
     std::vector<Rect2d> boxes;
 
+    // An fp16 model hands back fp16 blobs; everything below reads them as float.
+    for (Mat& out : outs)
+    {
+        if (out.depth() == CV_16F || out.depth() == CV_16BF)
+            out.convertTo(out, CV_32F);
+    }
+
     if (model_name == "yolov8" || model_name == "yolov10" ||
         model_name == "yolov9")
     {
@@ -3791,6 +3813,18 @@ TEST_P(Test_ONNX_layers, getUnconnectedOutLayers)
     EXPECT_GT(outIds[0], 0);
     Ptr<Layer> layer = net.getLayer(outIds[0]);
     ASSERT_TRUE(layer);
+}
+
+// A Resize node that carries only its data input makes the importer pick input
+// index 2 for "scales" (opset-11 layout) although the node holds index 0 only,
+// reading past the node's input list. roi/scales/sizes are optional in the
+// operator schema, so the model is valid ONNX and has to be rejected cleanly.
+// Test data: https://github.com/opencv/opencv_extra/pull/1427
+TEST(Test_ONNX_importer, parse_resize_too_few_inputs)
+{
+    Net net;
+    EXPECT_NO_THROW(net = readNetFromONNX(_tf("models/resize_no_scales.onnx")));
+    EXPECT_TRUE(net.empty());
 }
 
 }} // namespace

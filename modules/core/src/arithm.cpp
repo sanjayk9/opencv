@@ -623,9 +623,11 @@ enum { ARITHM_SMALL_DIRECT = 100000 };
 static void arithm_op(ew::TOp op, InputArray src1, InputArray src2, OutputArray dst,
                       InputArray mask, int dtype, int oclop, bool muldiv, const Scalar& params)
 {
-    CV_Assert(src1.empty() == src2.empty());
-    if (src1.empty() && src2.empty())          // empty inputs -> empty result
+    if (src1.empty() || src2.empty())          // empty inputs -> empty result
     {
+        CV_Assert((src1.empty() && src2.empty()) ||
+                  (src1.empty() && isScalarArg(src2, src1.channels())) ||
+                  (src2.empty() && isScalarArg(src1, src2.channels())));
         dst.release();
         if (dtype >= 0)
             dst.create(0, 0, dtype);
@@ -646,7 +648,7 @@ static void arithm_op(ew::TOp op, InputArray src1, InputArray src2, OutputArray 
 
     const bool haveMask = !mask.empty();
     const int cn1 = src1.channels(), cn2 = src2.channels();
-    bool s1 = isScalarArg(src1, cn2), s2 = isScalarArg(src2, cn1);
+    bool s1 = isScalarArg(src1, src2), s2 = isScalarArg(src2, src1);
     if (s1 && s2)
         s1 = s2 = false;    // two scalars: treat both as tiny array operands (element-wise + broadcast),
                             // matching arithm_op (Scalar+Scalar -> 4x1, number+number -> 1x1, ...)
@@ -1668,6 +1670,9 @@ void cv::inRange(InputArray _src, InputArray _lowerb,
     CV_INSTRUMENT_REGION();
 
     CV_Assert(! _src.empty());
+    if (!getInRangeFunc(_src.depth()))
+        CV_Error( cv::Error::StsNotImplemented,
+                 "inRange: CV_Bool and CV_8F inputs are not supported, convert the input to another type first");
 
     CV_OCL_RUN(_src.dims() <= 2 && _lowerb.dims() <= 2 &&
                _upperb.dims() <= 2 && OCL_PERFORMANCE_CHECK(_dst.isUMat()),

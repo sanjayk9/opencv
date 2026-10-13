@@ -216,6 +216,7 @@ protected:
     void parseGlobalPool           (LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto);
     void parseGRU                  (LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto);
     void parseRNN                  (LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto);
+    void parseGelu                 (LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto);
     void parseImageScaler          (LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto);
     void parseInstanceNormalization(LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto);
     void parseLayerNorm            (LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto);
@@ -1931,6 +1932,10 @@ Arg ONNXImporter2::resolveConstThroughIdentity(Arg arg)
 void ONNXImporter2::parseResize2(LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto)
 {
     int ninputs = node_proto.input_size();
+    // Resize always carries the data input plus scales or sizes, so the smallest
+    // valid node has 2 inputs (opset-10 [X, scales]); opset-11+ adds roi/sizes.
+    // scalesInputId below assumes that, so reject a short input list before indexing.
+    CV_CheckGE(ninputs, 2, "DNN/ONNX: Resize requires at least 2 inputs");
     layerParams.type = "Resize2";
     String interp_mode = layerParams.get<String>("coordinate_transformation_mode", "half_pixel");
 
@@ -2279,12 +2284,20 @@ void ONNXImporter2::parseSoftMax(LayerParams& layerParams, const opencv_onnx::No
     }
     const int opset_onnx_ai = onnx_opset_map[str_domain_ai_onnx];
 
-    if (opset_onnx_ai != 0 && opset_onnx_ai <= 11) {
+    // Softmax-13 is the first version that reduces along "axis" alone; up to opset 12 the
+    // spec coerces the input to 2D and reduces over the flattened dims [axis, rank), and
+    // the default axis is 1 rather than -1.  A node fused from an Exp/ReduceSum/Div
+    // subgraph states its own meaning through the attribute added by the simplifier.
+    bool coerced = (opset_onnx_ai != 0 && opset_onnx_ai < 13);
+    if (layerParams.has("coerced_2d"))
+        coerced = layerParams.get<bool>("coerced_2d");
+    if (coerced) {
         axis = layerParams.get<int>("axis", 1);
     } else {
         axis = layerParams.get<int>("axis", -1);
     }
     layerParams.set<int>("axis", axis);
+    layerParams.set("coerced_2d", coerced);
     layerParams.type = "Softmax";
     layerParams.set("log_softmax", layer_type == "LogSoftmax");
     addLayer(layerParams, node_proto);
@@ -2404,6 +2417,16 @@ void ONNXImporter2::parseLayerNorm(LayerParams& layerParams, const opencv_onnx::
     addLayer(layerParams, node_proto, n_inputs);
 }
 
+// Gelu(approximate='tanh') is 0.5*x*(1+tanh(sqrt(2/pi)*(x + 0.044715*x^3))), a different
+// function from the exact (erf-based) Gelu it is an approximation of. It has a layer of its
+// own, so route the attribute there instead of computing the exact form.
+void ONNXImporter2::parseGelu(LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto)
+{
+    if (layerParams.get<String>("approximate", "none") == "tanh")
+        layerParams.type = "GeluApproximation";
+    addLayer(layerParams, node_proto);
+}
+
 void ONNXImporter2::parseSimpleLayers(LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto)
 {
     addLayer(layerParams, node_proto);
@@ -2474,6 +2497,7 @@ void ONNXImporter2::parseDynamicQuantizeLinear(LayerParams& layerParams, const o
 
 void ONNXImporter2::parseRMSNormalization(LayerParams& layerParams, const opencv_onnx::NodeProto& node_proto)
 {
+    layerParams.type = "RMSNormalization";
     addLayer(layerParams, node_proto);
 }
 
@@ -2935,39 +2959,66 @@ void ONNXImporter2::parseMultiHeadAttention(LayerParams& params, const opencv_on
     addLayer(params, node_proto, (int)node_inputs.size());
 }
 
-// com.microsoft GroupQueryAttention (grouped, causal) -> AttentionOnnxAi.
+// Operator spec: https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md#com.microsoft.GroupQueryAttention
+// Supported opsets: com.microsoft 1. Supported inputs: 0..8, query through sin_cache.
+// Lowers to AttentionOnnxAi, told here about seqlens_k, rotary, the window and a shared buffer.
 void ONNXImporter2::parseGroupQueryAttention(LayerParams& params, const opencv_onnx::NodeProto& node_proto) {
     CV_CheckTrue(params.has("num_heads") && params.has("kv_num_heads"),
                  "GroupQueryAttention: num_heads and kv_num_heads are required");
-    CV_CheckEQ(params.get<int>("do_rotary", 0), 0, "GroupQueryAttention: do_rotary=1 is not supported");
-    CV_CheckEQ(params.get<int>("local_window_size", -1), -1, "GroupQueryAttention: sliding window is not supported");
     CV_CheckTrue(hasInput(node_proto, 1) && hasInput(node_proto, 2),
-                 "GroupQueryAttention: separate key and value are required");
-    for (int i = 7; i < node_proto.input_size(); i++)  // rotary / bias / KV-quant / QK-norm inputs
-        CV_CheckFalse(hasInput(node_proto, i), "GroupQueryAttention: only query/key/value/past_key/past_value are supported");
+                 "GroupQueryAttention: packed QKV is not supported, key and value must be separate");
 
-    // inputs: query, key, value, past_key, past_value, seqlens_k, total_sequence_length, ...
+    // inputs: query, key, value, past_key, past_value, seqlens_k, total_sequence_length,
+    //         cos_cache, sin_cache, ...
     const bool has_past_k = hasInput(node_proto, 3), has_past_v = hasInput(node_proto, 4);
     CV_CheckTrue(has_past_k == has_past_v,
                  "GroupQueryAttention: past_key and past_value must be provided as a pair");
+    CV_CheckTrue(hasInput(node_proto, 5), "GroupQueryAttention: seqlens_k is required");
 
-    std::vector<Arg> ins{node_inputs[0], node_inputs[1], node_inputs[2]};
-    if (has_past_k) {
-        // Dropping seqlens_k is only sound for a growing past. A fixed past seq dim means a
-        // shared-buffer cache whose real length lives in seqlens_k, so it would be mis-read.
-        const MatShape& pk = netimpl->args.at(node_inputs[3].idx).shape;
-        if (pk.dims >= 2)
-            CV_CheckLE(pk[pk.dims - 2], 0,
-                "GroupQueryAttention: past_key has a fixed sequence length (shared-buffer / static "
-                "cache export); only dynamic-cache exports are supported");
-        ins.push_back(node_inputs[3]); ins.push_back(node_inputs[4]);
+    const bool do_rotary = params.get<int>("do_rotary", 0) != 0;
+    if (do_rotary)
+        CV_CheckTrue(hasInput(node_proto, 7) && hasInput(node_proto, 8),
+                     "GroupQueryAttention: do_rotary=1 requires cos_cache and sin_cache");
+    for (int i = 9; i < node_proto.input_size(); i++)  // position_ids / attention_bias / head_sink
+        CV_CheckFalse(hasInput(node_proto, i),
+            "GroupQueryAttention: only inputs 0..8 (query .. sin_cache) are supported");
+
+    // A preallocated buffer is rewritten in place, so present_key keeps past_key's length;
+    // a growing cache declares a longer one. A static past alone does not separate them --
+    // a fully static export can still grow.
+    bool shared_buffer = false;
+    if (has_past_k && node_outputs.size() > 1) {
+        const MatShape& pastShape = netimpl->args.at(node_inputs[3].idx).shape;
+        const MatShape& presentShape = netimpl->args.at(node_outputs[1].idx).shape;
+        if (pastShape.dims >= 2 && presentShape.dims >= 2) {
+            const int pastLen = pastShape[pastShape.dims - 2];
+            const int presentLen = presentShape[presentShape.dims - 2];
+            // Only an explicitly longer present proves growth: onnxruntime treats a static
+            // past with a dynamic present as in-place reuse. Not '== pastLen'.
+            shared_buffer = (pastLen > 0 && !(presentLen > pastLen));
+        }
     }
+
+    // total_sequence_length (6) is redundant with seqlens_k and dropped.
+    std::vector<Arg> ins{node_inputs[0], node_inputs[1], node_inputs[2]};
+    if (has_past_k) { ins.push_back(node_inputs[3]); ins.push_back(node_inputs[4]); }
+    ins.push_back(node_inputs[5]);
+    if (do_rotary) { ins.push_back(node_inputs[7]); ins.push_back(node_inputs[8]); }
     node_inputs = ins;
 
     params.type = "AttentionOnnxAi";
     params.set("q_num_heads", params.get<int>("num_heads"));
     params.set("kv_num_heads", params.get<int>("kv_num_heads"));
     params.set("is_causal", true);
+    params.set("has_attn_mask", 0);
+    params.set("has_past", has_past_k ? 1 : 0);
+    params.set("has_seqlens_k", 1);
+    params.set("has_rotary_cache", do_rotary ? 1 : 0);
+    if (shared_buffer)
+        params.set("shared_kv_buffer", 1);
+    // GQA's scale=0 means 1/sqrt(head_size); AttentionOnnxAi would take the 0 literally.
+    if (params.has("scale") && params.get<float>("scale") == 0.f)
+        params.erase("scale");
 
     addLayer(params, node_proto, (int)node_inputs.size());
 }
@@ -3237,7 +3288,7 @@ void ONNXImporter2::buildDispatchMap_ONNX_AI()
     dispatch["Tile"] = &ONNXImporter2::parseTile;
     dispatch["LayerNormalization"] = &ONNXImporter2::parseLayerNorm;
     dispatch["GroupNormalization"] = &ONNXImporter2::parseInstanceNormalization;
-    dispatch["RMSNormalization"] = &ONNXImporter2::parseRMSNormalization;
+    dispatch["RMSNormalization"] = dispatch["SimplifiedLayerNormalization"] = &ONNXImporter2::parseRMSNormalization;
     dispatch["RotaryEmbedding"] = &ONNXImporter2::parseRotaryEmbedding;
     dispatch["NegativeLogLikelihoodLoss"] = &ONNXImporter2::parseNegativeLogLikelihoodLoss;
     dispatch["SoftmaxCrossEntropyLoss"]   = &ONNXImporter2::parseSoftmaxCrossEntropyLoss;
@@ -3258,13 +3309,13 @@ void ONNXImporter2::buildDispatchMap_ONNX_AI()
         "Acos", "Acosh", "Asin", "Asinh", "Atan", "Atanh", "Ceil", "Celu", "Cos",
         "Cosh", "Erf", "Exp", "Floor", "HardSigmoid", "HardSwish",
         "Identity", "Log", "Not", "Round", "Reciprocal", "Selu", "Sign", "Sigmoid", "Sin", "Sinh",
-        "Softplus", "Softsign", "Shrink", "Sqrt", "Tan", "ThresholdedRelu", "Gelu",
-        "GeluApproximation"
+        "Softplus", "Softsign", "Shrink", "Sqrt", "Tan", "ThresholdedRelu", "GeluApproximation"
     };
     for (const auto& name : simpleLayers)
     {
         dispatch[name] = &ONNXImporter2::parseSimpleLayers;
     }
+    dispatch["Gelu"] = &ONNXImporter2::parseGelu;
     dispatch["Dropout"] = &ONNXImporter2::parseDropout;
 
     // BUG: https://github.com/opencv/opencv/issues/26310

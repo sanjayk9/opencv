@@ -160,6 +160,19 @@ struct CV_EXPORTS_W_SIMPLE MatShape
     // compute shape of the result with possible broadcasting
     CV_WRAP MatShape expand(const MatShape& another) const;
 
+    // The operations below drop the layout, except for a block one: it is applied to the
+    // semantic NCHW form and blocked again, which only works while N and C stay unchanged.
+
+    // removes the given axes of size 1; all the axes of size 1 when axes is empty
+    CV_WRAP MatShape squeeze(const std::vector<int>& axes = std::vector<int>()) const;
+    // inserts axes of size 1; axes are positions in the result
+    CV_WRAP MatShape unsqueeze(const std::vector<int>& axes) const;
+    // merges the axes from startAxis to endAxis (inclusive) into one
+    CV_WRAP MatShape flatten(int startAxis = 0, int endAxis = -1) const;
+    // the shape of the same number of elements given by newShape, where -1 is inferred
+    // and 0 copies the corresponding axis of this shape (unless allowZero is set)
+    CV_WRAP MatShape reshape(const MatShape& newShape, bool allowZero = false) const;
+
     // convert shape between layouts
     CV_WRAP MatShape toLayout(DataLayout newLayout, int C0=0) const;
 
@@ -378,6 +391,15 @@ protected:
 
     void init(int _flags, const void* _obj);
     void init(int _flags, const void* _obj, Size _sz);
+
+private:
+    int dims_(int i=-1) const;
+    int cols_(int i=-1) const;
+    int rows_(int i=-1) const;
+    Size size_(int i=-1) const;
+    int type_(int i=-1) const;
+    int depth_(int i=-1) const;
+    bool empty_() const;
 };
 CV_ENUM_FLAGS(_InputArray::KindFlag)
 __CV_ENUM_FLAGS_BITWISE_AND(_InputArray::KindFlag, int, _InputArray::KindFlag)
@@ -520,6 +542,10 @@ public:
 
     void move(UMat& u) const;
     void move(Mat& m) const;
+
+private:
+    void create_(Size sz, int type, int i=-1, bool allowTransposed=false, _OutputArray::DepthMask fixedDepthMask=static_cast<_OutputArray::DepthMask>(0)) const;
+    void create_(int rows, int cols, int type, int i=-1, bool allowTransposed=false, _OutputArray::DepthMask fixedDepthMask=static_cast<_OutputArray::DepthMask>(0)) const;
 };
 
 

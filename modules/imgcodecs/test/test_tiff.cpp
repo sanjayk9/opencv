@@ -840,6 +840,41 @@ TEST(Imgcodecs_Tiff, read_palette_color_image_rgb_and_bgr)
     EXPECT_EQ(img_bgr.at<Vec3b>(32, 24), Vec3b(0, 0, 255));
 }
 
+TEST(Imgcodecs_Tiff, read_16bit_rgb_and_bgr)
+{
+    // Every sample differs so that a short or misdirected row copy is visible.
+    Mat src(8, 8, CV_16UC3);
+    for (int y = 0; y < src.rows; y++)
+    {
+        for (int x = 0; x < src.cols; x++)
+        {
+            src.at<Vec3w>(y, x) = Vec3w((ushort)(1000 + x), (ushort)(2000 + y), (ushort)(3000 + x + y));
+        }
+    }
+
+    vector<uchar> buf;
+    ASSERT_TRUE(imencode(".tiff", src, buf));
+
+    Mat img_rgb, img_bgr;
+    ASSERT_NO_THROW(img_bgr = cv::imdecode(buf, IMREAD_ANYDEPTH | IMREAD_COLOR_BGR));
+    ASSERT_NO_THROW(img_rgb = cv::imdecode(buf, IMREAD_ANYDEPTH | IMREAD_COLOR_RGB));
+    ASSERT_EQ(CV_16UC3, img_bgr.type());
+    ASSERT_EQ(CV_16UC3, img_rgb.type());
+
+    Mat expected_rgb(src.size(), CV_16UC3);
+    for (int y = 0; y < src.rows; y++)
+    {
+        for (int x = 0; x < src.cols; x++)
+        {
+            const Vec3w& s = src.at<Vec3w>(y, x);
+            expected_rgb.at<Vec3w>(y, x) = Vec3w(s[2], s[1], s[0]);
+        }
+    }
+
+    EXPECT_PRED_FORMAT2(cvtest::MatComparator(0, 0), src, img_bgr);
+    EXPECT_PRED_FORMAT2(cvtest::MatComparator(0, 0), expected_rgb, img_rgb);
+}
+
 TEST(Imgcodecs_Tiff, read_4_bit_palette_color_image)
 {
     const string root = cvtest::TS::ptr()->get_data_path();
@@ -1358,6 +1393,38 @@ const int Imgcodecs_Tiff_32F_Compressions_32F_All_Values[] =
 };
 
 INSTANTIATE_TEST_CASE_P(compressions_32F, Imgcodecs_Tiff_32F_Compressions_32F, testing::ValuesIn(Imgcodecs_Tiff_32F_Compressions_32F_All_Values));
+
+typedef testing::TestWithParam<ImwriteTiffCompressionFlags> Imgcodecs_Tiff_compression_schema;
+
+TEST_P(Imgcodecs_Tiff_compression_schema, normal)
+{
+    const ImwriteTiffCompressionFlags compression = GetParam();
+    cv::Mat src(cv::Size(320,240), CV_8UC3, cv::Scalar(45,167,56));
+    std::vector<uint8_t> buf;
+    bool ret = false;
+    EXPECT_NO_THROW(ret = imencode(".tif", src, buf, {IMWRITE_TIFF_COMPRESSION, compression}));
+    EXPECT_TRUE(ret);
+    EXPECT_FALSE(buf.empty());
+}
+
+const ImwriteTiffCompressionFlags Imgcodecs_Tiff_compression_schema_list[] =
+{
+    static_cast<ImwriteTiffCompressionFlags>(0), // Expected it is not defined
+    IMWRITE_TIFF_COMPRESSION_NONE,
+    IMWRITE_TIFF_COMPRESSION_LZW,
+    IMWRITE_TIFF_COMPRESSION_DEFLATE,
+    IMWRITE_TIFF_COMPRESSION_ADOBE_DEFLATE,
+    IMWRITE_TIFF_COMPRESSION_LZMA,
+    IMWRITE_TIFF_COMPRESSION_ZSTD,
+    IMWRITE_TIFF_COMPRESSION_WEBP,
+    IMWRITE_TIFF_COMPRESSION_JXL,
+    IMWRITE_TIFF_COMPRESSION_PIXARFILM, // Expected it is not supported.
+};
+
+INSTANTIATE_TEST_CASE_P(Imgcodecs_Tiff, Imgcodecs_Tiff_compression_schema,
+        testing::ValuesIn(Imgcodecs_Tiff_compression_schema_list),
+        testing::PrintToStringParamName()
+);
 
 #endif
 

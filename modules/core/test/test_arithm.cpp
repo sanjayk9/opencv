@@ -2526,6 +2526,60 @@ TEST(Compare, regression_8999)
     EXPECT_EQ(0, cvtest::norm(C, expected, NORM_INF));
 }
 
+// A 4x1 CV_64FC1 Mat is classified as a bindings-style Scalar (isScalarArg). That must never
+// happen against an operand of the same shape: such a pair is element-wise, as it is in 4.x.
+TEST(Core_Arithm, same_shape_is_elementwise)
+{
+    // a continuous 4x1 CV_64F operand met by a non-continuous view of the same shape - a column of
+    // a 4xN matrix of homogeneous points - used to broadcast the continuous side as a Scalar.
+    Mat Pf(4, 10, CV_32F); randu(Pf, 10, 100);
+    Mat cf = Pf.col(0), df;
+    subtract(cf.clone(), cf, df);
+    EXPECT_LT(cvtest::norm(df, NORM_INF), FLT_EPSILON);
+
+    Mat Pd(4, 10, CV_64F); randu(Pd, 10, 100);
+    Mat cd = Pd.col(0), dd;
+    subtract(cd.clone(), cd, dd);
+    EXPECT_LT(cvtest::norm(dd, NORM_INF), DBL_EPSILON);
+    subtract(cd, cd.clone(), dd);                        // the other operand order too
+    EXPECT_LT(cvtest::norm(dd, NORM_INF), DBL_EPSILON);
+
+    Mat Ps(4, 10, CV_64S); randu(Ps, 10, 100);
+    Mat cs = Ps.col(0), ds;
+    subtract(cs.clone(), cs, ds);
+    EXPECT_EQ(0, cvtest::norm(ds, NORM_INF));
+
+    UMat UPd; Pd.copyTo(UPd);                            // UMat, same thing (CPU and OpenCL paths)
+    UMat ucd = UPd.col(0), udd;
+    subtract(ucd.clone(), ucd, udd);
+    EXPECT_LT(cvtest::norm(udd.getMat(ACCESS_READ), NORM_INF), DBL_EPSILON);
+}
+
+// The flip side: a genuine Scalar partner keeps its per-channel semantics against a 4x1 CV_64FC1
+// array - only the Mat/UMat side is ever demoted to an array operand.
+TEST(Core_Arithm, scalar_vs_4x1_64F_array)
+{
+    Mat a = Mat_<double>({4, 1}, {10, 20, 30, 40}), d;
+    Mat expected1 = Mat_<double>({4, 1}, {5, 15, 25, 35});     // every element minus Scalar::val[0]
+    subtract(a, Scalar(5), d);
+    EXPECT_EQ(0, cvtest::norm(d, expected1, NORM_INF));
+    subtract(a, Scalar(5, 6, 7, 8), d);
+    EXPECT_EQ(0, cvtest::norm(d, expected1, NORM_INF));
+    subtract(a, Vec4d(5, 6, 7, 8), d);
+    EXPECT_EQ(0, cvtest::norm(d, expected1, NORM_INF));
+    d = a - Scalar(5);
+    EXPECT_EQ(0, cvtest::norm(d, expected1, NORM_INF));
+
+    Mat expected2 = Mat_<double>({4, 1}, {-5, -15, -25, -35});
+    subtract(Scalar(5), a, d);
+    EXPECT_EQ(0, cvtest::norm(d, expected2, NORM_INF));
+
+    // and the bindings-style 4x1 CV_64F Scalar still broadcasts over a REAL array
+    Mat img(2, 2, CV_8UC3, Scalar(100, 110, 120));
+    subtract(img, Mat_<double>({4, 1}, {1, 2, 3, 4}), d);
+    EXPECT_EQ(0, cvtest::norm(d, Mat(2, 2, CV_8UC3, Scalar(99, 108, 117)), NORM_INF));
+}
+
 TEST(Compare, regression_16F_do_not_crash)
 {
     cv::Mat mat1(2, 2, CV_16F, cv::Scalar(1));
@@ -3027,6 +3081,63 @@ TEST(Core_Norm, NORM_L2_8UC4)
     EXPECT_EQ(kNorm, cv::norm(a, b, NORM_L2));
 }
 
+// cv_abs() must return the magnitude for every input, including the lowest value of each signed
+// type, where the magnitude is not representable in that type and std::abs() is undefined.
+TEST(Core_CvAbs, lowest_signed_values)
+{
+    EXPECT_EQ((unsigned)INT_MAX + 1u, cv_abs(INT_MIN));
+    EXPECT_EQ((unsigned)INT_MAX,      cv_abs(INT_MAX));
+    EXPECT_EQ(1u,                     cv_abs(-1));
+
+    EXPECT_EQ((uint64)LLONG_MAX + 1ull, cv_abs((int64)LLONG_MIN));
+    EXPECT_EQ((uint64)LLONG_MAX,        cv_abs((int64)LLONG_MAX));
+    EXPECT_EQ(1ull,                     cv_abs((int64)-1));
+}
+
+// An L1 norm is a sum of magnitudes: never negative, and never dependent on the array length.
+// Checked over both signed integer depths, masked and unmasked, at lengths straddling the vector
+// width so the body, the tail and the two together are covered.
+typedef testing::TestWithParam< tuple<int, int64_t, int, bool> > Core_NormL1_Signed;
+
+TEST_P(Core_NormL1_Signed, exact_and_non_negative)
+{
+    const int     depth  = get<0>(GetParam());
+    const int64_t value  = get<1>(GetParam());
+    const int     len    = get<2>(GetParam());
+    const bool    masked = get<3>(GetParam());
+
+    if (depth == CV_32S && (value < INT_MIN || value > INT_MAX))
+        throw SkipTestException("value is out of int32 range");
+
+    Mat src(1, len, depth);
+    for (int i = 0; i < len; i++)
+    {
+        if (depth == CV_32S)
+            src.ptr<int>(0)[i] = (int)value;
+        else
+            src.ptr<int64_t>(0)[i] = value;
+    }
+    Mat mask = masked ? Mat(1, len, CV_8U, Scalar(255)) : Mat();
+
+    const double got = cv::norm(src, NORM_L1, mask);
+    // |value| and the total are both below 2^53 for the values used here, so this is exact
+    const double expected = (double)len * std::abs((double)value);
+
+    EXPECT_GE(got, 0.0) << "an L1 norm cannot be negative";
+    EXPECT_EQ(expected, got)
+        << "depth " << depth << ", value " << value << ", length " << len
+        << (masked ? ", masked" : "");
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Core_NormL1_Signed,
+    testing::Combine(
+        testing::Values(CV_32S, CV_64S),
+        testing::Values((int64_t)INT_MIN, (int64_t)INT_MAX, (int64_t)16777217,
+                        (int64_t)1073741825, (int64_t)-1073741825, (int64_t)1000,
+                        -(1LL << 52), (1LL << 52)),
+        testing::Values(1, 7, 8, 15, 16, 17, 33, 127),
+        testing::Bool()));
+
 TEST(Core_Norm, NORM_L2SQR_16SC4_large)
 {
     const int sizes[] = {1, 116, 40};
@@ -3131,6 +3242,54 @@ TEST(Core_ConvertTo, float_overflow_saturation)
     checkConvertToOverflow<double, int64>(CV_64F, CV_64S);
     checkConvertToOverflow<double, uint64>(CV_64F, CV_64U);
 }
+
+// Narrowing a 64-bit or 32-bit-unsigned array must SATURATE, and identically at every dispatch
+// level. The vectorized path narrows through a 32-bit intermediate, and v_pack() truncates at
+// 64->32 (unlike the narrower widths, which saturate), so an unclamped value used to wrap before
+// the final saturating step ever saw it - turning 4294967295 into 0 rather than 255. Only the
+// vector loop was affected, so the single element result is the reference. 127 elements covers
+// both the vector body and an odd tail.
+typedef testing::TestWithParam< tuple<int, int, double> > Core_ConvertToSaturate;
+
+TEST_P(Core_ConvertToSaturate, length_independent)
+{
+    const int srcDepth = get<0>(GetParam());
+    const int dstDepth = get<1>(GetParam());
+    const double value = get<2>(GetParam());
+    const int N = 127;
+
+    Mat one64(1, 1, CV_64F, Scalar(value));
+    Mat one; one64.convertTo(one, srcDepth);
+    Mat oneDst; one.convertTo(oneDst, dstDepth);
+    Mat ref; oneDst.convertTo(ref, CV_64F);
+    const double expected = ref.at<double>(0, 0);
+
+    Mat src64(1, N, CV_64F, Scalar(value));
+    Mat src; src64.convertTo(src, srcDepth);
+    Mat dst; src.convertTo(dst, dstDepth);
+    Mat got; dst.convertTo(got, CV_64F);
+
+    for (int i = 0; i < N; i++)
+        ASSERT_EQ(expected, got.at<double>(0, i)) << "index " << i;
+}
+
+INSTANTIATE_TEST_CASE_P(From32U, Core_ConvertToSaturate,
+    testing::Combine(
+        testing::Values(CV_32U),
+        testing::Values(CV_8U, CV_8S, CV_16U, CV_16S, CV_32S),
+        testing::Values(4294967295.0, 2147483648.0, 70000.0, 65536.0, 300.0)));
+
+// The 64-bit sources additionally carry values at opposite ends of the 64-bit range: a clamp built
+// on the 64-bit ordering compares gets those wrong at the SSE and NEON baselines, where v_gt is
+// the sign of a subtraction that overflows. They are not crossed with the CV_32U source, where
+// they would only exercise the double -> CV_32U conversion rather than the narrowing under test.
+INSTANTIATE_TEST_CASE_P(From64, Core_ConvertToSaturate,
+    testing::Combine(
+        testing::Values(CV_64U, CV_64S),
+        testing::Values(CV_8U, CV_8S, CV_16U, CV_16S, CV_32S),
+        testing::Values(4294967295.0, 2147483648.0, 65536.0, 300.0,
+                        -9223372036854775808.0, 9223372036854775807.0,
+                        -2147483649.0, -2147483648.0, -1.0)));
 
 TEST(Core_ConvertTo, regression_12121)
 {
@@ -4489,12 +4648,34 @@ TEST(Core_Arithm, addWeighted_fp64_uses_fp32_intermediate_29880)
     EXPECT_EQ(fp32Then64, dst.at<double>(0, 0));
 }
 
+// https://github.com/opencv/opencv/issues/30153
+TEST(Core_Arithm, inRange_unsupported_depth_30153)
+{
+    for (int depth : {CV_Bool, CV_8F_E4M3FN, CV_8F_E4M3FNUZ})
+    {
+        for (int cn : {1, 3})
+        {
+            cv::Mat src(4, 4, CV_MAKETYPE(depth, cn), cv::Scalar::all(0)), dst;
+            EXPECT_THROW(cv::inRange(src, cv::Scalar::all(0), cv::Scalar::all(1), dst), cv::Exception);
+            EXPECT_THROW(cv::inRange(src, src, src, dst), cv::Exception);
+        }
+    }
+}
+
 
 TEST(Core_Arithm, min_empty)
 {
   cv::Mat A, B, C;
   cv::max(A,B,C);
   EXPECT_TRUE(C.empty());
+}
+
+TEST(Core_Arithm, empty_sum)
+{
+  cv::Mat empty_mat;
+  cv::add(empty_mat, cv::Scalar(1.0), empty_mat);
+  ASSERT_TRUE(empty_mat.empty());
+  ASSERT_THROW(cv::Mat empty_sum = empty_mat + cv::Scalar(1.0), cv::Exception);
 }
 
 }} // namespace

@@ -752,6 +752,9 @@ void Net::Impl::finalize()
     for (const Ptr<Graph>& g : allgraphs)
         finalizeGraph(g, useCUDA);
     useBlockLayout();
+    // TransformLayout nodes only exist from here on; fuse residual Adds into
+    // them, and leave every layer already fused before the snapshot alone.
+    fuseTransformLayoutChains();
     assignBuffers();
     totalLayers = updateGraphOfs(mainGraph, 0, true);
 
@@ -1984,10 +1987,9 @@ void Net::Impl::forwardGraph(Ptr<Graph>& graph, InputArrayOfArrays inputs_,
                 outm.copyTo(outputsVec[i]);
             }
             // Narrow to the declared output dtype when an op computed in a wider type.
-            // Half is excepted: the graph was widened, so narrowing would only lose precision.
+            // Half included: the graph runs widened for lack of half kernels, but callers type
+            // their buffers off the model's declared output.
             int declaredOutType = i < mainGraphOutTypes.size() ? mainGraphOutTypes[i] : -1;
-            if (!enableFP16 && (declaredOutType == CV_16F || declaredOutType == CV_16BF))
-                declaredOutType = -1;
             if (declaredOutType >= 0 && !outputsVec[i].empty() &&
                 outputsVec[i].depth() != CV_MAT_DEPTH(declaredOutType))
             {
