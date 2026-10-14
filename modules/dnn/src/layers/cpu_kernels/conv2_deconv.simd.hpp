@@ -152,8 +152,8 @@ static void deconvBlock32f(const void* inp__, const void* /*residual*/,
                     const int v_per_block = C0 / VLANES;
                     const bool two_vecs = (v_per_block == 2);
                     if (v_per_block == 1 || two_vecs) {
-                        // Four independent accumulators so consecutive FMAs don't wait on each other:
-                        // one vector per block -> 4 channels at a time; two vectors -> 2 channels x 2 halves.
+                        // Four accumulators, so consecutive FMAs do not wait on each other:
+                        // 4 channels per step with one vector per block, 2 x 2 halves with two.
                         v_float32 acc0 = vx_load(out_ptr);
                         v_float32 acc1 = two_vecs ? vx_load(out_ptr + VLANES) : vx_setzero_f32();
                         v_float32 acc2 = vx_setzero_f32(), acc3 = vx_setzero_f32();
@@ -199,10 +199,11 @@ static void deconvBlock32f(const void* inp__, const void* /*residual*/,
                                 } else {
                                     for (int c0 = 0; c0 < C0; c0 += 4) {
                                         const float* w = w_c1p + c0 * K0;
-                                        acc0 = v_fma(vx_setall_f32(inp_ptr[c0]),     vx_load(w),          acc0);
-                                        acc1 = v_fma(vx_setall_f32(inp_ptr[c0 + 1]), vx_load(w + K0),     acc1);
-                                        acc2 = v_fma(vx_setall_f32(inp_ptr[c0 + 2]), vx_load(w + 2 * K0), acc2);
-                                        acc3 = v_fma(vx_setall_f32(inp_ptr[c0 + 3]), vx_load(w + 3 * K0), acc3);
+                                        const float* x = inp_ptr + c0;
+                                        acc0 = v_fma(vx_setall_f32(x[0]), vx_load(w), acc0);
+                                        acc1 = v_fma(vx_setall_f32(x[1]), vx_load(w + K0), acc1);
+                                        acc2 = v_fma(vx_setall_f32(x[2]), vx_load(w + 2*K0), acc2);
+                                        acc3 = v_fma(vx_setall_f32(x[3]), vx_load(w + 3*K0), acc3);
                                     }
                                 }
                             }
