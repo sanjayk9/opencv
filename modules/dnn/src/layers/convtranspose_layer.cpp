@@ -9,6 +9,7 @@
 #include "layers_common.hpp"
 #include "conv2_common.hpp"
 #include "cpu_kernels/mlas_gemm.hpp"
+#include "opencv2/core/hal/intrin.hpp"
 
 namespace cv
 {
@@ -115,156 +116,266 @@ public:
             rawBias.convertTo(bias, CV_32F);
     }
 
-    // With kernel == stride, dilation 1 and one group, every output pixel gets exactly one tap, so the
-    // layer is [pixels x Cin] * [Cin x (taps, Cout padded to C0)] followed by a scatter (forwardGemm).
+    // ConvTranspose as GEMM + col2im; B = [Cg x (taps * KC)] per group and output channel chunk.
+    // With one group the output channels are padded to whole C0 blocks.
     void packGemmWeights(const Mat& w, int C0)
     {
         gemmWeights.release();
-        gemmN = gemmK = gemmC0 = 0;
-        if (ngroups != 1 || !mlasAvailable() || !w.isContinuous())
+        gemmCg = gemmKg = gemmKgp = gemmKC = gemmChunks = gemmKsize = gemmC0 = 0;
+        gemmChunkStep = 0;
+        if (!mlasAvailable() || !w.isContinuous() || w.type() != CV_32F || w.dims < 3 ||
+            w.size[0] % ngroups != 0 || C0 % 4 != 0)
             return;
-        int nsd = w.dims - 2;
-        for (int i = 0; i < nsd; i++) {
-            int k = w.size[2 + i];
-            int s = strides.empty() ? 1 : strides[i];
-            int d = dilations.empty() ? 1 : dilations[i];
-            if (k != s || (k > 1 && d != 1))
-                return;
-        }
-        const int Cin = w.size[0], Cout = w.size[1];
-        const int ksize = (int)(w.total() / ((size_t)Cin * Cout));
-        const int Kpad = (Cout + C0 - 1) / C0 * C0;
-        const int N = ksize * Kpad;
+        const int Kg = w.size[1], Cg = w.size[0] / ngroups;
+        const int ksize = (int)(w.total() / ((size_t)w.size[0] * Kg));
+        const int Kgp = ngroups == 1 ? (int)alignSize(Kg, C0) : Kg;
+        // Overlapping taps limit how thin forwardGemm's bands can get, so parallelize over output
+        // channel chunks of about 128 GEMM columns instead.
+        const int s0 = strides.empty() ? 1 : strides[0], d0 = dilations.empty() ? 1 : dilations[0];
+        const bool overlap = (w.size[2] - 1) * d0 >= s0;
+        const int KC = !overlap || Kgp % C0 != 0 ? Kgp :
+                       std::min(Kgp, (int)alignSize((128 + ksize - 1) / ksize, C0));
+        const int nchunks = (Kgp + KC - 1) / KC;
 
-        Mat B(Cin, N, CV_32F, Scalar(0));
+        const size_t step = alignSize(mlasSgemmPackBSize(false, false, ksize * KC, Cg), 64);
+        if (step == 0 || step * ngroups * nchunks > (size_t)INT_MAX)
+            return;
+        gemmWeights.create(1, (int)(step * ngroups * nchunks), CV_8U);
+
+        Mat B(Cg, ksize * KC, CV_32F);
         const float* wdata = w.ptr<float>();
-        for (int c = 0; c < Cin; c++) {
-            float* brow = B.ptr<float>(c);
-            for (int k = 0; k < Cout; k++) {
-                const float* wk = wdata + ((size_t)c * Cout + k) * ksize;
-                for (int t = 0; t < ksize; t++)
-                    brow[t * Kpad + k] = wk[t];
+        for (int g = 0; g < ngroups; g++) {
+            for (int ch = 0; ch < nchunks; ch++) {
+                const int k0 = ch * KC, kn = std::min(KC, Kgp - k0);
+                B.setTo(Scalar(0));
+                for (int c = 0; c < Cg; c++) {
+                    float* brow = B.ptr<float>(c);
+                    for (int k = 0; k < kn && k0 + k < Kg; k++) {
+                        const float* wk = wdata + ((size_t)(g * Cg + c) * Kg + k0 + k) * ksize;
+                        for (int t = 0; t < ksize; t++)
+                            brow[t * kn + k] = wk[t];
+                    }
+                }
+                if (!mlasSgemmPackB(false, false, ksize * kn, Cg, B.ptr<float>(), ksize * KC,
+                                    gemmWeights.data + step * (g * nchunks + ch))) {
+                    gemmWeights.release();
+                    return;
+                }
             }
         }
-
-        size_t bytes = mlasSgemmPackBSize(false, false, N, Cin);
-        if (bytes == 0 || bytes > (size_t)INT_MAX)
-            return;
-        gemmWeights.create(1, (int)bytes, CV_8U);
-        if (!mlasSgemmPackB(false, false, N, Cin, B.ptr<float>(), N, gemmWeights.data)) {
-            gemmWeights.release();
-            return;
-        }
-        gemmN = N;
-        gemmK = Cin;
+        gemmChunkStep = step;
+        gemmCg = Cg;
+        gemmKg = Kg;
+        gemmKgp = Kgp;
+        gemmKC = KC;
+        gemmChunks = nchunks;
+        gemmKsize = ksize;
         gemmC0 = C0;
     }
 
-    // Output is exactly input * stride (no padding, no output_padding), so taps tile it.
     bool gemmCoversShape(const MatShape& inpshape, const MatShape& outshape) const
     {
-        if (gemmWeights.empty() || inpshape.C != gemmK || inpshape.back() != gemmC0 ||
-            outshape.back() != gemmC0 || gemmN % (outshape[1] * gemmC0) != 0)
-            return false;
-        const int sdims = cs.nspatialdims;
-        for (int i = 0; i < sdims; i++) {
-            int j = ConvState::MAX_CONV_DIMS - sdims + i;
-            if (cs.kshape[j] != cs.strides[j] || cs.pads[j] != 0 ||
-                cs.pads[j + ConvState::MAX_CONV_DIMS] != 0 ||
-                outshape[2 + i] != inpshape[2 + i] * cs.strides[j])
-                return false;
-        }
-        return true;
+        return !gemmWeights.empty() && inpshape.back() == gemmC0 && outshape.back() == gemmC0 &&
+               inpshape.C == gemmCg * ngroups && outshape.C == gemmKg * ngroups;
     }
+
+    static int floorDiv(int a, int b) { return a >= 0 ? a / b : -((b - 1 - a) / b); }
 
     void forwardGemm(const Mat& inp, Mat& out)
     {
         enum { MAX_DIMS = ConvState::MAX_CONV_DIMS };
         const MatShape& inpshape = inp.shape();
         const MatShape& outshape = out.shape();
-        const int sdims = cs.nspatialdims, C0 = inpshape.back();
-        const int N = inpshape[0], C1 = inpshape[1], K1 = outshape[1];
-        const int Cin = gemmK, ncols = gemmN, Kpad = K1 * C0, ksize = ncols / Kpad;
-        CV_Assert(ksize * Kpad == ncols);
+        const int sdims = cs.nspatialdims, C0 = gemmC0;
+        const int N = inpshape[0], C1 = inpshape[1], K1 = outshape[1], K = outshape.C;
+        const int Cg = gemmCg, Kg = gemmKg, Kgp = gemmKgp, KC = gemmKC, nchunks = gemmChunks;
+        const int ksize = gemmKsize;
+        const bool blocked = Kgp % C0 == 0;
 
-        int idims[MAX_DIMS], ostep[MAX_DIMS];
+        int idims[MAX_DIMS], odims[MAX_DIMS], strd[MAX_DIMS];
         int ispatial = 1, ospatial = 1;
-        for (int i = sdims - 1; i >= 0; i--) {
+        // Every output pixel gets exactly one tap, so it can be written instead of accumulated.
+        bool singleTap = blocked;
+        for (int i = 0; i < sdims; i++) {
+            const int j = MAX_DIMS - sdims + i;
             idims[i] = inpshape[2 + i];
-            ostep[i] = ospatial;
-            ispatial *= inpshape[2 + i];
-            ospatial *= outshape[2 + i];
+            odims[i] = outshape[2 + i];
+            strd[i] = cs.strides[j];
+            ispatial *= idims[i];
+            ospatial *= odims[i];
+            singleTap = singleTap && cs.kshape[j] == strd[i] &&
+                        (cs.kshape[j] == 1 || cs.dilations[j] == 1) && cs.pads[j] == 0 &&
+                        cs.pads[j + MAX_DIMS] == 0 && odims[i] == idims[i] * strd[i];
         }
 
-        // Output offset of each tap relative to the tap-0 pixel of its input position.
-        std::vector<int> tapofs(ksize);
+        // Tap t moves input coordinate x along dim i to x * strd[i] + tapofs[t * sdims + i];
+        // tapflat[t] is the same move in flat output positions.
+        int ostep[MAX_DIMS], minofs[MAX_DIMS], maxofs[MAX_DIMS];
+        for (int i = sdims - 1, step = 1; i >= 0; i--) {
+            ostep[i] = step;
+            step *= odims[i];
+            minofs[i] = INT_MAX;
+            maxofs[i] = INT_MIN;
+        }
+        std::vector<int> tapofs((size_t)ksize * sdims), tapflat(ksize, 0);
         for (int t = 0; t < ksize; t++) {
-            int tmp = t, ofs = 0;
+            int tmp = t;
             for (int i = sdims - 1; i >= 0; i--) {
-                int k = cs.kshape[MAX_DIMS - sdims + i];
-                ofs += (tmp % k) * ostep[i];
-                tmp /= k;
+                const int j = MAX_DIMS - sdims + i;
+                const int ofs = (tmp % cs.kshape[j]) * cs.dilations[j] - cs.pads[j];
+                tmp /= cs.kshape[j];
+                tapofs[t * sdims + i] = ofs;
+                tapflat[t] += ofs * ostep[i];
+                minofs[i] = std::min(minofs[i], ofs);
+                maxofs[i] = std::max(maxofs[i], ofs);
             }
-            tapofs[t] = ofs;
         }
+        const int minofs0 = minofs[0], maxofs0 = maxofs[0];
 
-        std::vector<float> biasbuf(Kpad, 0.f);
+        std::vector<float> biasbuf((size_t)K1 * C0, 0.f);
         if (!bias.empty())
-            std::copy(bias.ptr<float>(), bias.ptr<float>() + std::min((int)bias.total(), Kpad),
+            std::copy(bias.ptr<float>(), bias.ptr<float>() + std::min((int)bias.total(), K),
                       biasbuf.begin());
 
-        // A few row blocks per thread for balance; a block's rows stay in cache across the
-        // gather, the GEMM and the scatter. The GEMM runs serially inside each task.
-        const int nthreads = std::max(getNumThreads(), 1);
-        const int rows = (int)std::min<int64_t>(256, std::max<int64_t>(16,
-                             (int64_t)N * ispatial / (nthreads * 4)));
-        const int nblocks = (ispatial + rows - 1) / rows;
+        // A task owns a band of output rows in one channel chunk, so col2im needs no locking.
+        // Bands are at least 4x the tap overlap, so at most 1/4 of input rows run the GEMM twice.
+        const int O0 = odims[0], I0 = idims[0], S0 = strd[0], span0 = maxofs0 - minofs0;
+        const int iinner = ispatial / I0, oinner = ospatial / O0;
+        const int ntasks0 = N * ngroups * nchunks;
+        const int wantBands = std::max(1, (getNumThreads() * 4 + ntasks0 - 1) / ntasks0);
+        const int minRows = span0 < S0 ? S0 : (int)alignSize(4 * span0, S0);
+        const int bandRows = std::max(minRows,
+                                      (int)alignSize((O0 + wantBands - 1) / wantBands, S0));
+        const int nbands = (O0 + bandRows - 1) / bandRows;
+        const int rows = std::max(16, std::min(256, (1 << 17) / (ksize * KC)));
 
         const float* inpdata = inp.ptr<float>();
         float* outdata = out.ptr<float>();
         const float* biasdata = biasbuf.data();
 
-        parallel_for_(Range(0, N * nblocks), [&](const Range& range) {
-            AutoBuffer<float> buf((size_t)rows * (Cin + ncols));
+        // Groups vary fastest, so groups sharing a C0 block mostly stay on one thread.
+        parallel_for_(Range(0, ntasks0 * nbands), [&](const Range& range) {
+            AutoBuffer<float> buf((size_t)rows * (Cg + ksize * KC));
             float* A = buf.data();
-            float* Cm = A + (size_t)rows * Cin;
+            float* Cm = A + (size_t)rows * Cg;
+            AutoBuffer<size_t> ofsbuf((size_t)Cg + K1 * C0);
+            size_t* cofs = ofsbuf.data();
+            size_t* kofs = cofs + Cg;
+            int x[MAX_DIMS];
 
             for (int task = range.start; task < range.end; task++) {
-                const int n = task / nblocks;
-                const int p0 = (task % nblocks) * rows;
-                const int M = std::min(rows, ispatial - p0);
+                const int g = task % ngroups, ch = (task / ngroups) % nchunks;
+                const int band = (task / (ngroups * nchunks)) % nbands;
+                const int n = task / (ngroups * nchunks * nbands);
+                const int o0 = band * bandRows, o1 = std::min(o0 + bandRows, O0);
+                const int cfirst = g * Cg, kfirst = g * Kg + ch * KC;
+                const int kn = std::min(KC, Kgp - ch * KC), ncols = ksize * kn;
                 const float* inp_n = inpdata + (size_t)n * C1 * ispatial * C0;
                 float* out_n = outdata + (size_t)n * K1 * ospatial * C0;
+                // Offsets of each input channel and output channel (or block) at spatial pos 0.
+                for (int c = 0; c < Cg; c++)
+                    cofs[c] = (size_t)((cfirst + c) / C0) * ispatial * C0 + (cfirst + c) % C0;
+                const int nk = blocked ? kn / C0 : (g == ngroups - 1 ? K1 * C0 - kfirst : Kg);
+                for (int k = 0; k < nk; k++) {
+                    const int kk = blocked ? kfirst + k * C0 : kfirst + k;
+                    kofs[k] = (size_t)(kk / C0) * ospatial * C0 + kk % C0;
+                }
 
-                for (int m = 0; m < M; m++) {
-                    float* arow = A + (size_t)m * Cin;
-                    for (int c1 = 0; c1 < C1; c1++) {
-                        const float* src = inp_n + ((size_t)c1 * ispatial + p0 + m) * C0;
-                        int nc = std::min(C0, Cin - c1 * C0);
-                        std::copy(src, src + nc, arow + c1 * C0);
+                // Start from the bias; the padding lanes of the last block end up zero.
+                for (int opos = o0 * oinner; !singleTap && opos < o1 * oinner; opos++) {
+                    float* out_p = out_n + (size_t)opos * C0;
+                    if (blocked) {
+                        for (int b = 0; b < nk; b++) {
+                            const float* bb = biasdata + kfirst + b * C0;
+                            std::copy(bb, bb + C0, out_p + kofs[b]);
+                        }
+                    } else {
+                        for (int k = 0; k < nk; k++)
+                            out_p[kofs[k]] = biasdata[kfirst + k];
                     }
                 }
 
-                bool ok = mlasSgemmPacked(false, false, M, ncols, Cin, 1.f, A, Cin,
-                                          gemmWeights.data, 0.f, Cm, ncols);
-                CV_Assert(ok);
+                // Input rows whose taps reach [o0, o1) along the first spatial dim.
+                const int ilo = std::max(0, -floorDiv(maxofs0 - o0, S0));
+                const int ihi = std::min(I0 - 1, floorDiv(o1 - 1 - minofs0, S0));
+                const int pend = (ihi + 1) * iinner;
 
-                for (int m = 0; m < M; m++) {
-                    int tmp = p0 + m, obase = 0;
-                    for (int i = sdims - 1; i >= 0; i--) {
-                        obase += (tmp % idims[i]) * cs.strides[MAX_DIMS - sdims + i] * ostep[i];
-                        tmp /= idims[i];
+                for (int p0 = ilo * iinner; p0 < pend; p0 += rows) {
+                    const int M = std::min(rows, pend - p0);
+                    for (int m = 0; m < M; m++) {
+                        float* arow = A + (size_t)m * Cg;
+                        const float* inp_p = inp_n + (size_t)(p0 + m) * C0;
+                        if (cfirst % C0 == 0) {
+                            for (int c = 0; c < Cg; c += C0) {
+                                const float* src = inp_p + cofs[c];
+                                std::copy(src, src + std::min(C0, Cg - c), arow + c);
+                            }
+                        } else {
+                            for (int c = 0; c < Cg; c++)
+                                arow[c] = inp_p[cofs[c]];
+                        }
                     }
-                    const float* crow = Cm + (size_t)m * ncols;
-                    for (int t = 0; t < ksize; t++) {
-                        const int opos = obase + tapofs[t];
-                        const float* src = crow + t * Kpad;
-                        for (int k1 = 0; k1 < K1; k1++) {
-                            float* dst = out_n + ((size_t)k1 * ospatial + opos) * C0;
-                            const float* s = src + k1 * C0;
-                            const float* b = biasdata + k1 * C0;
-                            for (int j = 0; j < C0; j++)
-                                dst[j] = s[j] + b[j];
+
+                    bool ok = mlasSgemmPacked(false, false, M, ncols, Cg, 1.f, A, Cg,
+                                              gemmWeights.data + gemmChunkStep * (g * nchunks + ch),
+                                              0.f, Cm, ncols);
+                    CV_Assert(ok);
+
+                    // col2im: add each (pixel, tap) row of Cm to the output pixel it lands on.
+                    auto emit = [&](int opos, const float* src) {
+                        float* out_p = out_n + (size_t)opos * C0;
+                        if (singleTap || blocked) {
+                            // In a block, C0 is a multiple of 4.
+                            for (int b = 0; b < nk; b++) {
+                                float* dst = out_p + kofs[b];
+                                const float* s = src + b * C0;
+                                const float* acc = singleTap ? biasdata + kfirst + b * C0 : dst;
+                                for (int j = 0; j < C0; j += 4) {
+#if CV_SIMD128
+                                    v_store(dst + j, v_add(v_load(s + j), v_load(acc + j)));
+#else
+                                    for (int l = j; l < j + 4; l++)
+                                        dst[l] = s[l] + acc[l];
+#endif
+                                }
+                            }
+                        } else {
+                            for (int k = 0; k < Kg; k++)
+                                out_p[kofs[k]] += src[k];
+                        }
+                    };
+                    for (int m = 0; m < M; m++) {
+                        int tmp = p0 + m, base = 0;
+                        bool interior = true;
+                        for (int i = sdims - 1; i >= 0; i--) {
+                            x[i] = tmp % idims[i];
+                            tmp /= idims[i];
+                            const int o = x[i] * strd[i];
+                            base += o * ostep[i];
+                            interior = interior && o + minofs[i] >= (i == 0 ? o0 : 0) &&
+                                       o + maxofs[i] < (i == 0 ? o1 : odims[i]);
+                        }
+                        const float* crow = Cm + (size_t)m * ncols;
+                        if (interior) {
+                            for (int t = 0; t < ksize; t++)
+                                emit(base + tapflat[t], crow + t * kn);
+                            continue;
+                        }
+                        for (int t = 0; t < ksize; t++) {
+                            const int* ofs = &tapofs[t * sdims];
+                            int o = x[0] * S0 + ofs[0];
+                            if (o < o0 || o >= o1)
+                                continue;
+                            int opos = o;
+                            int i = 1;
+                            for (; i < sdims; i++) {
+                                o = x[i] * strd[i] + ofs[i];
+                                if (o < 0 || o >= odims[i])
+                                    break;
+                                opos = opos * odims[i] + o;
+                            }
+                            if (i == sdims)
+                                emit(opos, crow + t * kn);
                         }
                     }
                 }
@@ -450,8 +561,9 @@ public:
     std::vector<int> emptyKernelShape;
     std::vector<int> explicit_out_shape;
     Mat weights, bias;
-    Mat gemmWeights;  // MLAS-packed B for forwardGemm(), empty when the shape doesn't qualify
-    int gemmN = 0, gemmK = 0, gemmC0 = 0;
+    Mat gemmWeights;  // MLAS-packed B per (group, channel chunk), empty without MLAS
+    size_t gemmChunkStep = 0;
+    int gemmCg = 0, gemmKg = 0, gemmKgp = 0, gemmKC = 0, gemmChunks = 0, gemmKsize = 0, gemmC0 = 0;
     MatShape wshape0, prevInpshape;
     ConvState cs;
 };
