@@ -10,6 +10,7 @@
 #include "conv2_common.hpp"
 #include "cpu_kernels/mlas_gemm.hpp"
 #include "opencv2/core/hal/intrin.hpp"
+#include <opencv2/core/utils/configuration.private.hpp>
 
 namespace cv
 {
@@ -109,8 +110,10 @@ public:
             rawWeights.convertTo(wfloat, CV_32F);
         else
             wfloat = rawWeights;
-        repackDeconvWeights(wfloat, weights, CV_32F, ngroups, C0);
         packGemmWeights(wfloat, C0);
+        weights.release();
+        if (gemmWeights.empty())
+            repackDeconvWeights(wfloat, weights, CV_32F, ngroups, C0);
 
         if (!rawBias.empty())
             rawBias.convertTo(bias, CV_32F);
@@ -123,8 +126,12 @@ public:
         gemmWeights.release();
         gemmCg = gemmKg = gemmKgp = gemmKC = gemmChunks = gemmKsize = gemmC0 = 0;
         gemmChunkStep = 0;
-        if (!mlasAvailable() || !w.isContinuous() || w.type() != CV_32F || w.dims < 3 ||
-            w.size[0] % ngroups != 0 || C0 % 4 != 0)
+        // CI's Deconvolution tests all take this path on an MLAS build; flip to false to
+        // exercise the fallback deconvBlock32f kernel instead.
+        static const bool useGemm =
+            utils::getConfigurationParameterBool("OPENCV_DNN_CONVTRANSPOSE_GEMM", true);
+        if (!useGemm || !mlasAvailable() || !w.isContinuous() || w.type() != CV_32F ||
+            w.dims < 3 || w.size[0] % ngroups != 0 || C0 % 4 != 0)
             return;
         const int Kg = w.size[1], Cg = w.size[0] / ngroups;
         const int ksize = (int)(w.total() / ((size_t)w.size[0] * Kg));
@@ -480,7 +487,7 @@ public:
             if (!netimpl_->isConstArg(inputs[i]))
                 dynamicWeights = true;
         }
-        if (dynamicWeights || weights.empty()) {
+        if (dynamicWeights || (weights.empty() && gemmWeights.empty())) {
             setWeights(input_arrs.getMat(1), ninputs > 2 ? input_arrs.getMat(2) : Mat(),
                        inpshape.back(), netimpl_->accuracy);
         }
@@ -544,6 +551,7 @@ public:
         } else {
             DeconvFunc func = getDeconvFunc(inptype);
             CV_Assert(func != nullptr);
+            CV_Assert(!weights.empty());
             const float* bias_data = bias.empty() ? nullptr : bias.ptr<float>();
             func(inp.data, nullptr, out.data, cs, weights.data, nullptr, bias_data);
         }
