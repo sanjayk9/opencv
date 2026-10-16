@@ -600,6 +600,24 @@ TEST(Videoio, exceptions)
     EXPECT_THROW(cap.open("this_does_not_exist.avi", CAP_OPENCV_MJPEG), Exception);
 }
 
+// Intra-only codec: every frame is its own key frame, so like CAP_IMAGES a seek is always exact.
+TEST(videoio_mjpeg, pos_frames_seek_is_always_exact)
+{
+    if (!videoio_registry::hasBackend(CAP_OPENCV_MJPEG))
+        throw SkipTestException("CAP_OPENCV_MJPEG backend was not found");
+
+    VideoCapture cap(findDataFile("video/big_buck_bunny.mjpg.avi"), CAP_OPENCV_MJPEG);
+    ASSERT_TRUE(cap.isOpened());
+
+    for (int target : {0, 1, 5, 12, 24, 62, 100, 124})
+    {
+        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+        EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
+        Mat frame;
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
+    }
+}
+
 
 typedef Videoio_Writer Videoio_Writer_bad_fourcc;
 

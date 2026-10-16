@@ -63,13 +63,14 @@ class XINECapture : public IVideoCapture
     xine_video_frame_t xine_frame;
     Size size;
     int frame_number;
+    bool frame_number_unknown; // a time-based frame seek can't tell where it landed until the next grab
     double frame_rate; // fps
     double frame_duration; // ms
     bool seekable;
 
   public:
     XINECapture()
-        : xine(0), stream(0), vo_port(0), frame_number(-1), frame_rate(0.), frame_duration(0.),
+        : xine(0), stream(0), vo_port(0), frame_number(-1), frame_number_unknown(false), frame_rate(0.), frame_duration(0.),
           seekable(false)
     {
         xine_video_frame_t z = {};
@@ -161,6 +162,7 @@ class XINECapture : public IVideoCapture
     {
         CV_Assert(vo_port);
         bool res = xine_get_next_video_frame(vo_port, &xine_frame);
+        frame_number_unknown = false;
         if (res)
             frame_number++;
         return res;
@@ -214,7 +216,7 @@ class XINECapture : public IVideoCapture
         switch (property_id)
         {
         case CAP_PROP_POS_MSEC: return res ? pos_t : CAP_PROP_UNKNOWN;
-        case CAP_PROP_POS_FRAMES: return frame_number;
+        case CAP_PROP_POS_FRAMES: return frame_number_unknown ? (double)CAP_PROP_UNKNOWN : frame_number;
         case CAP_PROP_POS_AVI_RATIO: return length && res ? pos_l / 65535.0 : CAP_PROP_UNKNOWN;
         case CAP_PROP_FRAME_WIDTH: return size.width;
         case CAP_PROP_FRAME_HEIGHT: return size.height;
@@ -297,6 +299,7 @@ protected:
             if (xine_play(stream, 0, new_time))
             {
                 frame_number = f;
+                frame_number_unknown = true;
                 return true;
             }
         }

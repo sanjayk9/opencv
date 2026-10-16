@@ -1403,4 +1403,150 @@ TEST(videoio_ffmpeg_encoder_props, no_regression_without_properties)
 }
 #endif
 
+// big_buck_bunny.mp4: mpeg4, 24fps, 125 frames, key frame every 12 frames (0,12,...,120).
+static string posFramesTestVideoPath()
+{
+    return findDataFile("video/big_buck_bunny.mp4");
+}
+
+static std::vector<Mat> readFirstFrames(const string& path, int maxFrames)
+{
+    std::vector<Mat> frames;
+    VideoCapture cap(path, CAP_FFMPEG);
+    Mat frame;
+    while ((int)frames.size() < maxFrames && cap.read(frame))
+        frames.push_back(frame.clone());
+    return frames;
+}
+
+// FFmpeg's own seek-then-decode-forward already lands exactly; confirm the generic layer agrees.
+TEST(videoio_ffmpeg_pos_frames, non_raw_seek_is_always_exact)
+{
+    if (!videoio_registry::hasBackend(CAP_FFMPEG))
+        throw SkipTestException("FFmpeg backend was not found");
+
+    VideoCapture cap(posFramesTestVideoPath(), CAP_FFMPEG);
+    ASSERT_TRUE(cap.isOpened());
+
+    for (int target : {0, 1, 5, 12, 15, 20, 24, 62, 100, 124})
+    {
+        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+        EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
+        Mat frame;
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
+    }
+}
+
+// RAW mode has no codec to decode forward with, so a seek is exact only when the target is itself a key frame.
+TEST(videoio_ffmpeg_pos_frames, raw_mode_seek_is_exact_only_on_key_frames)
+{
+    if (!videoio_registry::hasBackend(CAP_FFMPEG))
+        throw SkipTestException("FFmpeg backend was not found");
+
+    VideoCapture cap(posFramesTestVideoPath(), CAP_FFMPEG, {CAP_PROP_FORMAT, -1});
+    ASSERT_TRUE(cap.isOpened());
+
+    struct { int target; int landed; bool exact; } cases[] = {
+        {0, 0, true}, {12, 12, true}, {24, 24, true},    // requested frame is itself a key frame
+        {5, 0, false}, {15, 12, false}, {20, 12, false}, // between key frames 0 and 12
+        {62, 60, false}, {100, 96, false}, {124, 120, false},
+    };
+    for (const auto& c : cases)
+    {
+        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, c.target)) << "target " << c.target;
+        // Checked before read(): a raw-mode grab right after a seek can leave the reported position unchanged.
+        EXPECT_EQ(c.landed, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << "target " << c.target;
+        EXPECT_EQ(c.exact ? 1 : 0, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << c.target;
+        Mat raw;
+        ASSERT_TRUE(cap.read(raw)) << "target " << c.target;
+    }
+}
+
+// Sweeps every frame in the file, in both modes: landing past the target would make set() fail.
+TEST(videoio_ffmpeg_pos_frames, seek_never_lands_past_the_target)
+{
+    if (!videoio_registry::hasBackend(CAP_FFMPEG))
+        throw SkipTestException("FFmpeg backend was not found");
+
+    for (bool raw : {false, true})
+    {
+        VideoCapture cap = raw
+            ? VideoCapture(posFramesTestVideoPath(), CAP_FFMPEG, {CAP_PROP_FORMAT, -1})
+            : VideoCapture(posFramesTestVideoPath(), CAP_FFMPEG);
+        ASSERT_TRUE(cap.isOpened()) << "raw=" << raw;
+
+        for (int target = 0; target < 125; target++)
+        {
+            ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "raw=" << raw << " target=" << target;
+            double landed = cap.get(CAP_PROP_POS_FRAMES);
+            ASSERT_NE(static_cast<double>(CAP_PROP_UNKNOWN), landed) << "raw=" << raw << " target=" << target;
+            EXPECT_LE(cvRound(landed), target) << "raw=" << raw << " target=" << target;
+            Mat frame;
+            ASSERT_TRUE(cap.read(frame)) << "raw=" << raw << " target=" << target;
+        }
+    }
+}
+
+// A timestamp seek to the start of this MPEG-PS file lands on frame 12, so early targets need a verified rewind.
+TEST(videoio_ffmpeg_pos_frames, seek_near_start_of_mpeg_ps_is_exact)
+{
+    if (!videoio_registry::hasBackend(CAP_FFMPEG))
+        throw SkipTestException("FFmpeg backend was not found");
+
+    const string path = findDataFile("video/big_buck_bunny.mpg");
+    std::vector<Mat> reference = readFirstFrames(path, 16);
+    ASSERT_EQ(16u, reference.size());
+
+    for (int target = 0; target < 16; target++)
+    {
+        VideoCapture cap(path, CAP_FFMPEG);
+        ASSERT_TRUE(cap.isOpened());
+        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+        EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << "target " << target;
+        EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
+        Mat frame;
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
+        EXPECT_EQ(0, cvtest::norm(frame, reference[target], NORM_INF)) << "target " << target;
+    }
+}
+
+// This AVI can't be rewound verifiably, so a seek near the start must report unknown rather than a wrong exact landing.
+TEST(videoio_ffmpeg_pos_frames, unverifiable_seek_reports_unknown)
+{
+    if (!videoio_registry::hasBackend(CAP_FFMPEG))
+        throw SkipTestException("FFmpeg backend was not found");
+
+    const string path = findDataFile("video/VID00003-20100701-2204.avi");
+    for (int target = 0; target < 16; target++)
+    {
+        VideoCapture cap(path, CAP_FFMPEG);
+        ASSERT_TRUE(cap.isOpened());
+        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+        EXPECT_EQ(-1, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << "target " << target;
+        EXPECT_EQ(-1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
+        Mat frame;
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
+    }
+}
+
+// The exactness verdict belongs to the last seek, so a later seek by time or ratio must clear it.
+TEST(videoio_ffmpeg_pos_frames, seek_by_time_or_ratio_clears_exactness)
+{
+    if (!videoio_registry::hasBackend(CAP_FFMPEG))
+        throw SkipTestException("FFmpeg backend was not found");
+
+    VideoCapture cap(posFramesTestVideoPath(), CAP_FFMPEG);
+    ASSERT_TRUE(cap.isOpened());
+
+    ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, 50));
+    ASSERT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+    ASSERT_TRUE(cap.set(CAP_PROP_POS_MSEC, 0));
+    EXPECT_EQ(-1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+
+    ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, 50));
+    ASSERT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+    ASSERT_TRUE(cap.set(CAP_PROP_POS_AVI_RATIO, 0));
+    EXPECT_EQ(-1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+}
+
 }} // namespace

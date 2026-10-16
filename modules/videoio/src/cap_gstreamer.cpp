@@ -521,6 +521,8 @@ private:
     bool          syncLastFrame;
     bool          lastFrame;
     gint64        emulatedFrameNumber;
+    bool          seekLandedPending; // a CAP_PROP_POS_FRAMES seek happened and nothing was grabbed since
+    gint64        seekLandedFrame;   // the frame that seek prerolled, or -1 if it couldn't be told
     gint          outputAudioFormat;
     gint          audioBitPerSample;
     gint          audioBaseIndex;
@@ -564,6 +566,8 @@ protected:
     void restartPipeline();
     void setFilter(const char *prop, int type, int v1, int v2);
     void removeFilter(const char *filter);
+    bool seekToTimeAndGetFrame(gint64 ns, gint64& prerolledFrame);
+    void resetEndOfStream();
 };
 
 GStreamerCapture::GStreamerCapture() :
@@ -589,6 +593,8 @@ GStreamerCapture::GStreamerCapture() :
     syncLastFrame(true),
     lastFrame(false),
     emulatedFrameNumber(-1),
+    seekLandedPending(false),
+    seekLandedFrame(-1),
     outputAudioFormat(CV_16S),
     audioBitPerSample(16),
     audioBaseIndex(1),
@@ -717,6 +723,8 @@ bool GStreamerCapture::grabFrame()
 {
     if (!pipeline || !GST_IS_ELEMENT(pipeline.get()))
         return false;
+
+    seekLandedPending = false;
 
     // start the pipeline if it was not in playing state yet
     if (!this->isPipelinePlaying())
@@ -1383,6 +1391,7 @@ void GStreamerCapture::stopPipeline()
         CV_WARN("GStreamer: pipeline have not been created");
         return;
     }
+    seekLandedPending = false; // a stopped pipeline starts over, so the last seek result no longer applies
     if (gst_element_set_state(pipeline, GST_STATE_NULL) == GST_STATE_CHANGE_FAILURE)
     {
         CV_WARN("unable to stop pipeline");
@@ -2027,19 +2036,24 @@ double GStreamerCapture::getProperty(int propId) const
     case CAP_PROP_POS_MSEC:
         return double(timestamp) / GST_MSECOND;
     case CAP_PROP_POS_FRAMES:
+        if (seekLandedPending)
+            return seekLandedFrame >= 0 ? (double)seekLandedFrame : (double)CAP_PROP_UNKNOWN;
         if (!isPosFramesSupported)
         {
             if (isPosFramesEmulated)
                 return emulatedFrameNumber;
             return CAP_PROP_UNKNOWN;
         }
-        format = GST_FORMAT_DEFAULT;
+        // The GST_FORMAT_DEFAULT query truncates n / fps back to n - 1, so round the time position instead.
+        format = fps > 0 ? GST_FORMAT_TIME : GST_FORMAT_DEFAULT;
         status = gst_element_query_position(sink.get(), CV_GST_FORMAT(format), &value);
         if(!status) {
             handleMessage(pipeline);
             CV_WARN("GStreamer: unable to query position of stream");
             return CAP_PROP_UNKNOWN;
         }
+        if (format == GST_FORMAT_TIME)
+            return (double)(gint64)((double)value * fps / GST_SECOND + 0.5);
         return value;
     case CAP_PROP_POS_AVI_RATIO:
         format = GST_FORMAT_PERCENT;
@@ -2150,6 +2164,9 @@ bool GStreamerCapture::setProperty(int propId, double value)
         }
         else
         {
+            resetEndOfStream();
+            seekLandedPending = false;
+
             // Optimistically caching the target timestamp before reading the first frame from the new position since
             // the timestamp in GStreamer can be reliable extracted from the read frames.
             timestamp = (gint64)value;
@@ -2184,19 +2201,44 @@ bool GStreamerCapture::setProperty(int propId, double value)
             CV_WARN("unable to seek");
             return false;
         }
-        // Certain mov and mp4 files seek incorrectly if the pipeline is not stopped before.
-        if (this->isPipelinePlaying()) {
-            this->stopPipeline();
+        // Seeks need a PAUSED pipeline: it accepts the seek and holds the landed frame as the preroll until grabFrame() resumes playback.
+        if (this->isPipelinePlaying())
+        {
+            if (gst_element_set_state(pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE ||
+                gst_element_get_state(pipeline, NULL, NULL, readTimeout) == GST_STATE_CHANGE_ASYNC)
+            {
+                handleMessage(pipeline);
+                CV_WARN("GStreamer: unable to pause pipeline before seeking");
+                return false;
+            }
         }
 
-        if(!gst_element_seek_simple(GST_ELEMENT(pipeline.get()), GST_FORMAT_DEFAULT,
-                                    flags, (gint64) value)) {
-            handleMessage(pipeline);
-            CV_WARN("GStreamer: unable to seek");
-            return false;
+        seekLandedPending = false;
+        if (fps > 0)
+        {
+            // Seek to mid-frame (safe from rounding); if that skipped to the next key frame, retry at the exact start.
+            const gint64 target = (gint64)value;
+            gint64 landed = -1;
+            if (!seekToTimeAndGetFrame((gint64)((target + 0.5) * GST_SECOND / fps), landed))
+                return false;
+            if (landed == target + 1 &&
+                !seekToTimeAndGetFrame((gint64)(target * GST_SECOND / fps), landed))
+                return false;
+            seekLandedFrame = landed;
+            seekLandedPending = true;
         }
-        // wait for status update
-        gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
+        else
+        {
+            if(!gst_element_seek_simple(GST_ELEMENT(pipeline.get()), GST_FORMAT_DEFAULT,
+                                        flags, (gint64) value)) {
+                handleMessage(pipeline);
+                CV_WARN("GStreamer: unable to seek");
+                return false;
+            }
+            // wait for status update
+            gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
+        }
+        resetEndOfStream();
         return true;
     }
     case CAP_PROP_POS_AVI_RATIO:
@@ -2212,6 +2254,9 @@ bool GStreamerCapture::setProperty(int propId, double value)
         }
         else
         {
+            resetEndOfStream();
+            seekLandedPending = false;
+
             if (isPosFramesEmulated)
             {
                 if (value == 0)
@@ -2321,6 +2366,44 @@ bool GStreamerCapture::setProperty(int propId, double value)
     return false;
 }
 
+
+// Accurate seek to `ns`, then read the prerolled frame's index (-1 if unknown); the preroll stays queued.
+bool GStreamerCapture::seekToTimeAndGetFrame(gint64 ns, gint64& prerolledFrame)
+{
+    prerolledFrame = -1;
+    if (!gst_element_seek_simple(GST_ELEMENT(pipeline.get()), GST_FORMAT_TIME,
+                                 (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE), ns))
+    {
+        handleMessage(pipeline);
+        CV_WARN("GStreamer: unable to seek");
+        return false;
+    }
+    gst_element_get_state(pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
+
+    GSafePtr<GstSample> preroll;
+    preroll.attach(gst_app_sink_try_pull_preroll(GST_APP_SINK(sink.get()), readTimeout));
+    GstBuffer* buf = preroll ? gst_sample_get_buffer(preroll) : NULL;
+    const GstSegment* segment = preroll ? gst_sample_get_segment(preroll) : NULL;
+    if (!buf || !segment || !GST_BUFFER_PTS_IS_VALID(buf))
+        return true;
+    // A corrupted picture (e.g. decoding started inside an open GOP) is not the requested frame.
+    if (GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_CORRUPTED))
+        return true;
+
+    // Frame n starts at n / fps (a clipped one lies inside); +0.25 rounds up anything within a quarter frame below a start, absorbing ns truncation.
+    guint64 streamTime = gst_segment_to_stream_time(segment, GST_FORMAT_TIME, GST_BUFFER_PTS(buf));
+    if (GST_CLOCK_TIME_IS_VALID(streamTime))
+        prerolledFrame = (gint64)std::floor((double)streamTime * fps / GST_SECOND + 0.25);
+    return true;
+}
+
+// A seek leaves the end of the stream, so the EOS state must not carry over to the next grabFrame().
+void GStreamerCapture::resetEndOfStream()
+{
+    vEOS = false;
+    aEOS = false;
+    lastFrame = false;
+}
 
 Ptr<IVideoCapture> createGStreamerCapture_file(const String& filename, const cv::VideoCaptureParameters& params)
 {

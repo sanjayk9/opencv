@@ -167,6 +167,7 @@ private:
 
     CMTime mFrameTimestamp;
     size_t mFrameNum;
+    bool mFrameNumUnknown; // a frame seek can't tell where the reader starts until the next grab
 
     int started;
 };
@@ -710,6 +711,7 @@ CvCaptureFile::CvCaptureFile(const char* filename) {
     mGrabbedPixels = NULL;
     mFrameTimestamp = kCMTimeZero;
     mFrameNum = 0;
+    mFrameNumUnknown = false;
 
     started = 0;
 
@@ -833,6 +835,7 @@ bool CvCaptureFile::grabFrame() {
     CVBufferRetain(mGrabbedPixels);
     mFrameTimestamp = CMSampleBufferGetOutputPresentationTimeStamp(mCurrentSampleBuffer);
     mFrameNum++;
+    mFrameNumUnknown = false;
 
     bool isReading = (mAssetReader.status == AVAssetReaderStatusReading);
     [localpool drain];
@@ -1016,6 +1019,7 @@ double CvCaptureFile::getProperty_(int property_id) const{
         case cv::CAP_PROP_POS_MSEC:
             return mFrameTimestamp.value * 1000.0 / mFrameTimestamp.timescale;
         case cv::CAP_PROP_POS_FRAMES:
+            if (mFrameNumUnknown) return cv::CAP_PROP_UNKNOWN;
             return mAssetTrack.nominalFrameRate > 0 ? mFrameNum : 0;
         case cv::CAP_PROP_POS_AVI_RATIO:
             t = [mAsset duration];
@@ -1067,6 +1071,7 @@ bool CvCaptureFile::setProperty_(int property_id, double value) {
             } else {
                 retval = false;
             }
+            mFrameNumUnknown = retval;
             break;
         }
         case cv::CAP_PROP_POS_AVI_RATIO:
