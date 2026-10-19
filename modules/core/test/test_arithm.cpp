@@ -2398,6 +2398,22 @@ TEST(Core_FindNonZero, regression)
     ASSERT_TRUE(pts.size() == nz);
 }
 
+TEST(Core_FindNonZero, fp8)
+{
+    // columns: +0, -0, 1, -2, NaN
+    float vals[] = { 0.f, -0.f, 1.f, -2.f, std::numeric_limits<float>::quiet_NaN() };
+    Mat src32f(1, 5, CV_32F, vals);
+    std::vector<Point> expected = { Point(2, 0), Point(3, 0), Point(4, 0) };
+    for (int depth : {CV_8F_E4M3FN, CV_8F_E4M3FNUZ})
+    {
+        Mat src;
+        src32f.convertTo(src, depth);
+        std::vector<Point> pts;
+        findNonZero(src, pts);
+        EXPECT_EQ(expected, pts) << depthToString(depth);
+    }
+}
+
 TEST(Core_BoolVector, support)
 {
     std::vector<bool> test;
@@ -3290,6 +3306,54 @@ INSTANTIATE_TEST_CASE_P(From64, Core_ConvertToSaturate,
         testing::Values(4294967295.0, 2147483648.0, 65536.0, 300.0,
                         -9223372036854775808.0, 9223372036854775807.0,
                         -2147483649.0, -2147483648.0, -1.0)));
+
+// Converting from CV_32U must hold two properties, for every value and every array length:
+//   - the result is never negative, because the source is unsigned;
+//   - a destination that can represent the value exactly does so, which among the destinations
+//     covered here means CV_64F.
+// Both the plain and the scaled (alpha/beta) conversion paths are checked, since they are separate
+// implementations. Lengths straddle the vector width so that the vectorized body, the scalar tail
+// and the two together are all exercised.
+typedef testing::TestWithParam< tuple<int, unsigned, int, bool> > Core_ConvertFrom32U;
+
+TEST_P(Core_ConvertFrom32U, exact_and_unsigned)
+{
+    const int      dstDepth = get<0>(GetParam());
+    const unsigned value    = get<1>(GetParam());
+    const int      len      = get<2>(GetParam());
+    const bool     scaled   = get<3>(GetParam());
+
+    // alpha of exactly 1 with beta 0 is treated as "no scale" and routes to getConvertFunc(), so the
+    // scaled arm has to use a real scale factor to reach getConvertScaleFunc() at all
+    const double alpha = scaled ? 2.0 : 1.0;
+
+    Mat src(1, len, CV_32U, Scalar(value));
+    Mat dst;
+    if (scaled)
+        src.convertTo(dst, dstDepth, alpha, 0.0);
+    else
+        src.convertTo(dst, dstDepth);
+    Mat got; dst.convertTo(got, CV_64F);
+
+    for (int i = 0; i < len; i++)
+    {
+        SCOPED_TRACE(cv::format("dstDepth=%d value=%u len=%d scaled=%d i=%d",
+                                dstDepth, value, len, (int)scaled, i));
+        EXPECT_GE(got.at<double>(0, i), 0.0) << "an unsigned source cannot convert to a negative";
+        if (dstDepth == CV_64F)
+        {
+            // alpha * value stays below 2^53 for every value used here, so this is exact
+            EXPECT_EQ(alpha * (double)value, got.at<double>(0, i));
+        }
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Core_ConvertFrom32U,
+    testing::Combine(
+        testing::Values(CV_64F, CV_16BF, CV_16F, CV_32F),
+        testing::Values(0u, 1u, 16777217u, 2147483647u, 2147483648u, 3000000000u, 4294967295u),
+        testing::Values(1, 7, 8, 127),
+        testing::Bool()));
 
 TEST(Core_ConvertTo, regression_12121)
 {
@@ -4662,6 +4726,27 @@ TEST(Core_Arithm, inRange_unsupported_depth_30153)
     }
 }
 
+TEST(Core_Arithm, sum_unsupported_depth)
+{
+    for (int depth : {CV_Bool, CV_8F_E4M3FN, CV_8F_E4M3FNUZ})
+    {
+        for (int cn : {1, 3})
+        {
+            if (depth == CV_Bool && cn == 1)
+                continue; // single-channel CV_Bool is supported by cv::sum
+            cv::Mat src(4, 4, CV_MAKETYPE(depth, cn), cv::Scalar::all(0));
+            try
+            {
+                cv::sum(src);
+                ADD_FAILURE() << "cv::sum did not throw for " << cv::typeToString(src.type());
+            }
+            catch (const cv::Exception& e)
+            {
+                EXPECT_NE(std::string::npos, e.err.find(cv::typeToString(src.type()))) << e.err;
+            }
+        }
+    }
+}
 
 TEST(Core_Arithm, min_empty)
 {
