@@ -12,6 +12,7 @@ ocv_add_dispatched_file_force_all("layers/cpu_kernels/conv_winograd_f63" AVX AVX
 ocv_add_dispatched_file_force_all("layers/cpu_kernels/fast_gemm_kernels" AVX AVX2 NEON LASX RVV)
 ocv_add_dispatched_file("layers/cpu_kernels/conv2_depthwise" AVX AVX2 NEON NEON_FP16)
 ocv_add_dispatched_file("layers/cpu_kernels/conv2_kernels" AVX AVX2 NEON NEON_FP16)
+ocv_add_dispatched_file("layers/cpu_kernels/conv2_deconv" AVX AVX2 NEON)
 ocv_add_dispatched_file("int8layers/conv2_int8_kernels" AVX2 RVV AVX_VNNI)
 ocv_add_dispatched_file("layers/cpu_kernels/activation_kernels" AVX AVX2 NEON NEON_FP16)
 ocv_add_dispatched_file_force_all("layers/cpu_kernels/gridsample_kernels" AVX AVX2 NEON RVV LASX)
@@ -400,13 +401,12 @@ if(HAVE_PROTOBUF)
   ocv_target_compile_definitions(${the_module} PRIVATE "HAVE_PROTOBUF=1")
 
   if(PROTOBUF_UPDATE_FILES)
-    file(GLOB proto_files "${CMAKE_CURRENT_LIST_DIR}/src/tensorflow/*.proto" "${CMAKE_CURRENT_LIST_DIR}/src/onnx/opencv-onnx.proto")
+    file(GLOB proto_files "${CMAKE_CURRENT_LIST_DIR}/src/onnx/opencv-onnx.proto")
     if(CMAKE_VERSION VERSION_LESS "3.13.0")
-      set(PROTOBUF_GENERATE_CPP_APPEND_PATH ON) # required for tensorflow
       protobuf_generate_cpp(fw_srcs fw_hdrs ${proto_files})
     else()
       protobuf_generate(
-        APPEND_PATH # required for tensorflow
+        APPEND_PATH
         LANGUAGE cpp
         IMPORT_DIRS ${Protobuf_IMPORT_DIRS}
         OUT_VAR fw_srcs
@@ -418,9 +418,9 @@ if(HAVE_PROTOBUF)
       list(FILTER fw_hdrs INCLUDE REGEX ".+\.h$")
     endif()
   else()
-    file(GLOB fw_srcs "${CMAKE_CURRENT_LIST_DIR}/misc/tensorflow/*.cc" "${CMAKE_CURRENT_LIST_DIR}/misc/onnx/opencv-onnx.pb.cc")
-    file(GLOB fw_hdrs "${CMAKE_CURRENT_LIST_DIR}/misc/tensorflow/*.h" "${CMAKE_CURRENT_LIST_DIR}/misc/onnx/opencv-onnx.pb.h")
-    set(fw_inc "${CMAKE_CURRENT_LIST_DIR}/misc/tensorflow" "${CMAKE_CURRENT_LIST_DIR}/misc/onnx")
+    file(GLOB fw_srcs "${CMAKE_CURRENT_LIST_DIR}/misc/onnx/opencv-onnx.pb.cc")
+    file(GLOB fw_hdrs "${CMAKE_CURRENT_LIST_DIR}/misc/onnx/opencv-onnx.pb.h")
+    set(fw_inc "${CMAKE_CURRENT_LIST_DIR}/misc/onnx")
   endif()
 endif()
 
@@ -500,6 +500,7 @@ endif()
 # CPU SGEMM accelerator (asm/intrinsic kernels) and the wasm scalar fallback
 # offers no benefit for the JS bindings build that produces opencv.js.
 set(HAVE_MLAS 0)
+set(MLAS_EXTERNAL_OBJECTS "")
 # Reset status flags + arch booleans
 foreach(_v OPENCV_DNN_MLAS_ENABLED OPENCV_DNN_MLAS_SKIP_REASON
            MLAS_X86_64 MLAS_X86 MLAS_ARM MLAS_ARM64 MLAS_POWER
@@ -511,6 +512,10 @@ if(NOT EMSCRIPTEN)
   add_subdirectory("${OpenCV_SOURCE_DIR}/3rdparty/mlas" "${CMAKE_BINARY_DIR}/3rdparty/mlas")
 endif()
 if(HAVE_MLAS)
+  if(MLAS_EXTERNAL_OBJECTS)
+    # Older CMake versions do not propagate GENERATED from the MLAS directory.
+    set_source_files_properties(${MLAS_EXTERNAL_OBJECTS} PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  endif()
   add_definitions(-DHAVE_MLAS=1)
   list(APPEND include_dirs ${MLAS_INCLUDE_DIRS})
   message(STATUS "DNN: MLAS (vendored) enabled.")
@@ -539,7 +544,7 @@ set(dnn_plugin_srcs ${dnn_srcs} ${dnn_int_hdrs})
 ocv_list_filterout_ex(dnn_plugin_srcs
     "/src/dnn.cpp$|/src/dnn_utils.cpp$|/src/dnn_read.cpp$|/src/registry.cpp$|/src/backend.cpp$"
     # importers
-    "/src/(onnx|tensorflow)/|/src/protobuf_io.cpp$"
+    "/src/onnx/"
     # executors
     "/src/(cuda|cuda4dnn|ocl4dnn|vkcom|webnn)/"
 )

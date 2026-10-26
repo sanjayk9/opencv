@@ -1369,5 +1369,62 @@ TEST(Imgproc_Warping, convertMaps_remap_warpPolar_validation)
     EXPECT_THROW(cv::getRectSubPix(src, Size(3, -1), Point2f(1.f, 1.f), dst), cv::Exception);
 }
 
+TEST(Imgproc_ConvertMaps, regression_22763)
+{
+    Mat base(16, 16, CV_32FC2, Scalar(0.0f, 0.0f));
+    Mat src1 = base(Rect(1, 2, 3, 4));
+    Mat src2, dst1, dst2;
+
+    ASSERT_FALSE(src1.isContinuous());
+    ASSERT_TRUE(src2.empty());
+
+    convertMaps(src1, src2, dst1, dst2, CV_16SC2, false);
+
+    EXPECT_EQ(src1.size(), dst1.size());
+    EXPECT_EQ(CV_16SC2, dst1.type());
+    EXPECT_EQ(src1.size(), dst2.size());
+    EXPECT_EQ(CV_16UC1, dst2.type());
+}
+
+// https://github.com/opencv/opencv/issues/30301
+typedef testing::TestWithParam<testing::tuple<int, int> > Imgproc_GetRectSubPix_Border;
+
+TEST_P(Imgproc_GetRectSubPix_Border, regression_30301)
+{
+    const int depth = get<0>(GetParam()), ddepth = get<1>(GetParam());
+
+    // The images are ROIs of a buffer filled with 250, so reads outside of them show up in the result
+    const Rect rampRoi(8, 8, 4, 4), columnRoi(2, 2, 1, 4);
+    Mat buf8u(20, 20, CV_8UC1, Scalar(250)), buf;
+    for (int r = 0; r < 4; r++)
+    {
+        for (int c = 0; c < 4; c++)
+            buf8u(rampRoi).at<uchar>(r, c) = (uchar)(r * 40 + c * 8);
+        buf8u(columnRoi).at<uchar>(r, 0) = (uchar)(10 + r * 10);
+    }
+    buf8u.convertTo(buf, depth);
+
+    const struct { Rect roi; Size size; Point2f center; std::vector<float> expected; } cases[] = {
+        // the window crosses the top and the right edges
+        { rampRoi, Size(3, 3), Point2f(3.f, 0.f), { 16, 24, 24, 16, 24, 24, 56, 64, 64 } },
+        { columnRoi, Size(3, 3), Point2f(0.f, 0.f), { 10, 10, 10, 10, 10, 10, 20, 20, 20 } },
+        // the window is to the left of the image
+        { rampRoi, Size(1, 1), Point2f(-2.75f, 3.f), { 120 } },
+    };
+    for (const auto& tc : cases)
+    {
+        SCOPED_TRACE(cv::format("image=%dx%d center=(%g, %g)", tc.roi.width, tc.roi.height, tc.center.x, tc.center.y));
+        Mat patch, patch32f;
+        getRectSubPix(buf(tc.roi), tc.size, tc.center, patch, ddepth);
+        patch.convertTo(patch32f, CV_32F);
+        Mat expected = Mat(tc.expected).reshape(1, tc.size.height);
+        EXPECT_LE(cvtest::norm(patch32f, expected, NORM_INF), 1e-3) << patch32f;
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Imgproc_GetRectSubPix_Border, testing::Values(
+    testing::make_tuple(CV_8U, CV_8U), testing::make_tuple(CV_8U, CV_32F), testing::make_tuple(CV_32F, CV_32F)));
+
+
 }} // namespace
 /* End of file. */
