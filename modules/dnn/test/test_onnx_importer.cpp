@@ -8,6 +8,7 @@
 
 #include "test_precomp.hpp"
 #include "npy_blob.hpp"
+#include "../src/mapped_file.hpp"
 #include <opencv2/dnn/shape_utils.hpp>
 #include <numeric>
 namespace opencv_test { namespace {
@@ -2451,6 +2452,27 @@ TEST_P(Test_ONNX_layers, MatMulInteger)
     }
 }
 
+// B is packed on the first forward; once setUseOptimized() selects a kernel that reads another
+// layout (AVX2 and the others differ), the next forward must pack it again
+TEST(Test_ONNX_layers_MatMulInteger, repacks_B_after_setUseOptimized)
+{
+    Net net = readNetFromONNX(_tf("models/matmulinteger_u8_per_column.onnx"), ENGINE_OPENCV);
+    ASSERT_FALSE(net.empty());
+    Mat inp = blobFromNPY(_tf("data/input_matmulinteger_u8_per_column.npy"));
+    Mat ref = blobFromNPY(_tf("data/output_matmulinteger_u8_per_column.npy"));
+    struct RestoreUseOptimized
+    {
+        bool flag = useOptimized();
+        ~RestoreUseOptimized() { setUseOptimized(flag); }
+    } restore;
+    for (bool flag : {restore.flag, !restore.flag, restore.flag})
+    {
+        setUseOptimized(flag);
+        net.setInput(inp);
+        normAssert(ref, net.forward(), flag ? "optimized" : "not optimized");
+    }
+}
+
 TEST_P(Test_ONNX_layers, Quantized_MatMul)
 {
     testONNXModels("quantized_matmul_uint8_weights", npy, 0.008, 0.015);
@@ -2466,6 +2488,72 @@ TEST_P(Test_ONNX_layers, Quantized_Gemm)
 TEST_P(Test_ONNX_layers, Gemm_External_Data)
 {
     testONNXModels("gemm_external_data", npy);
+}
+
+TEST_P(Test_ONNX_layers, LayerNorm_External_Data)
+{
+    testONNXModels("layer_norm_external_data", npy);
+}
+
+// ENGINE_ORT registers the file for ONNX Runtime without parsing it, so neither the mapping
+// nor the bounds check below is reached.
+static bool ortEngineForced()
+{
+    return static_cast<cv::dnn::EngineType>(cv::utils::getConfigurationParameterSizeT(
+               "OPENCV_FORCE_DNN_ENGINE", cv::dnn::ENGINE_AUTO)) == cv::dnn::ENGINE_ORT;
+}
+
+TEST_P(Test_ONNX_layers, LayerNorm_External_Data_Unaligned)
+{
+    if (ortEngineForced())
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
+
+    const uint64_t views = cv::dnn::mappedViewCount();
+    Net net = readNetFromONNX(_tf("models/layer_norm_external_data_unaligned.onnx"),
+                              ENGINE_AUTO, /*mapExternalData*/ true);
+    ASSERT_FALSE(net.empty());
+    net.setPreferableBackend(backend);
+    net.setPreferableTarget(target);
+
+    net.setInput(blobFromNPY(_tf("data/input_layer_norm_external_data_unaligned.npy")));
+    const Mat out = net.forward();
+
+    // A refused mapping copies instead and yields the same values; only the count separates them.
+    if (cv::utils::getConfigurationParameterBool("OPENCV_DNN_ONNX_MMAP_EXTERNAL_DATA", true))
+    {
+        EXPECT_GT(cv::dnn::mappedViewCount(), views);
+    }
+    normAssert(blobFromNPY(_tf("data/output_layer_norm_external_data_unaligned.npy")), out);
+}
+
+TEST_P(Test_ONNX_layers, LayerNorm_External_Data_Truncated)
+{
+    if (ortEngineForced())
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
+
+    // A range past the end of the file must be refused here; mapping it faults at inference.
+    EXPECT_THROW(readNetFromONNX(_tf("models/layer_norm_external_data_truncated.onnx")),
+                 cv::Exception);
+}
+
+TEST_P(Test_ONNX_layers, LayerNorm_External_Data_MappingDisabled)
+{
+    if (ortEngineForced())
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
+
+    const uint64_t views = cv::dnn::mappedViewCount();
+    Net net = readNetFromONNX(_tf("models/layer_norm_external_data_unaligned.onnx"),
+                              ENGINE_AUTO, /*mapExternalData*/ false);
+    ASSERT_FALSE(net.empty());
+    net.setPreferableBackend(backend);
+    net.setPreferableTarget(target);
+
+    net.setInput(blobFromNPY(_tf("data/input_layer_norm_external_data_unaligned.npy")));
+    const Mat out = net.forward();
+
+    // Nothing was mapped, and the copy path produces the same values.
+    EXPECT_EQ(cv::dnn::mappedViewCount(), views);
+    normAssert(blobFromNPY(_tf("data/output_layer_norm_external_data_unaligned.npy")), out);
 }
 
 
@@ -2654,8 +2742,8 @@ TEST_P(Test_ONNX_nets, RAFT)
     Size target_size{480, 360};
     auto img0 = imread(img0_path);
     auto img1 = imread(img1_path);
-    auto blob0 = blobFromImage(img0, 1.0, target_size, 0, true);
-    auto blob1 = blobFromImage(img1, 1.0, target_size, 0, true);
+    auto blob0 = blobFromImage(img0, 1.0, target_size, 0, true, false, CV_32F, /*interpolation*/ cv::INTER_LINEAR_EXACT);
+    auto blob1 = blobFromImage(img1, 1.0, target_size, 0, true, false, CV_32F, /*interpolation*/ cv::INTER_LINEAR_EXACT);
 
     auto net = readNet(weight_path);
     net.setInput(blob0, "0");
@@ -3526,7 +3614,8 @@ TEST_P(Test_ONNX_nets, YOLOv5n)
         CV_32F,
         DNN_LAYOUT_NCHW,
         DNN_PMODE_NULL,
-        Scalar::all(0)
+        Scalar::all(0),
+        cv::INTER_LINEAR_EXACT
         );
 
     testYOLO(weightPath, refClassIds, refScores, refBoxes, imgParams);
