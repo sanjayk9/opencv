@@ -447,6 +447,270 @@ TEST(videoio_gstreamer_encoder_props, fourcc_path_encodes)
     EXPECT_LT(nv12Size, rawSize / 4);
     remove(nv12File.c_str());
 }
+//==============================================================================
+// CAP_PROP_POS_FRAMES seeks must land on the requested frame
 
+static std::vector<Mat> readAllGstreamerFrames(const std::string& source, int maxFrames)
+{
+    std::vector<Mat> frames;
+    VideoCapture cap(source, CAP_GSTREAMER);
+    Mat frame;
+    while ((int)frames.size() < maxFrames && cap.read(frame))
+        frames.push_back(frame.clone());
+    return frames;
+}
+
+// Index of the closest frame in `reference`, a sequential decode by the same backend.
+static int nearestFrameIndex(const Mat& frame, const std::vector<Mat>& reference)
+{
+    int best = -1;
+    double bestDist = DBL_MAX;
+    for (size_t i = 0; i < reference.size(); i++)
+    {
+        double dist = cv::norm(frame, reference[i], NORM_L1);
+        if (dist < bestDist)
+        {
+            bestDist = dist;
+            best = (int)i;
+        }
+    }
+    return best;
+}
+
+static const int gopFixtureFrameCount = 30;
+
+// Each encoded frame is a flat, distinct color.
+static Scalar gopFixtureFrameColor(int i)
+{
+    return Scalar(i * 5 % 256, (i * 7 + 30) % 256, (i * 11 + 60) % 256);
+}
+
+// By default an mp4 with a key frame every 12 frames, so most seek targets sit between key frames.
+static std::string generateGopFixture(const std::string& x264Options = "key-int-max=12 bframes=0",
+                                      const std::string& muxer = "qtmux", const std::string& ext = ".mp4")
+{
+    std::string path = cv::tempfile(ext.c_str());
+    std::string pipeline = "appsrc ! videoconvert ! x264enc " + x264Options + " ! h264parse ! " + muxer + " ! filesink location=" + path;
+    VideoWriter writer(pipeline, CAP_GSTREAMER, 0, 24.0, Size(64, 48), true);
+    if (!writer.isOpened())
+        return std::string();
+    for (int i = 0; i < gopFixtureFrameCount; i++)
+        writer.write(Mat(48, 64, CV_8UC3, gopFixtureFrameColor(i)));
+    return path;
+}
+
+static std::string posFramesPipelineWithoutDuration(int srcFrameCount, double srcFps)
+{
+    std::ostringstream pipeline;
+    pipeline << "videotestsrc pattern=ball num-buffers=" << srcFrameCount
+             << " ! video/x-raw,framerate=" << cvRound(srcFps) << "/1 ! appsink";
+    return pipeline.str();
+}
+
+// videotestsrc has no duration: only a seek to frame 0 works, and a failed seek must not claim exact.
+TEST(videoio_gstreamer_pos_frames, pipeline_without_duration_only_seeks_to_start)
+{
+    if (!videoio_registry::hasBackend(CAP_GSTREAMER))
+        throw SkipTestException("GStreamer backend was not found");
+
+    VideoCapture cap;
+    ASSERT_NO_THROW(cap.open(posFramesPipelineWithoutDuration(30, 30.0), CAP_GSTREAMER));
+    ASSERT_TRUE(cap.isOpened());
+
+    Mat frame;
+    ASSERT_TRUE(cap.read(frame));
+
+    for (int target : {0, 5, 0, 20})
+    {
+        if (target == 0)
+        {
+            ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target));
+            EXPECT_EQ(0, cvRound(cap.get(CAP_PROP_POS_FRAMES)));
+            EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+        }
+        else
+        {
+            EXPECT_FALSE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+            EXPECT_EQ(-1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
+        }
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
+    }
+}
+
+TEST(videoio_gstreamer_pos_frames, real_file_seek_is_exact)
+{
+    if (!videoio_registry::hasBackend(CAP_GSTREAMER))
+        throw SkipTestException("GStreamer backend was not found");
+
+    VideoCapture cap(findDataFile("video/big_buck_bunny.mp4"), CAP_GSTREAMER);
+    ASSERT_TRUE(cap.isOpened());
+
+    for (int target : {0, 5, 15, 62, 100})
+    {
+        ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+        EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << "target " << target;
+        EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
+        Mat frame;
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
+    }
+}
+
+// Seeks back and forth on one capture must report the requested frame and read back its content.
+TEST(videoio_gstreamer_pos_frames, seek_lands_on_the_requested_frame)
+{
+    if (!videoio_registry::hasBackend(CAP_GSTREAMER))
+        throw SkipTestException("GStreamer backend was not found");
+
+    std::string path = generateGopFixture();
+    if (path.empty())
+        throw SkipTestException("GStreamer x264enc encoder was not available to build the test fixture");
+
+    std::vector<Mat> reference = readAllGstreamerFrames(path, gopFixtureFrameCount + 1);
+    ASSERT_EQ((size_t)gopFixtureFrameCount, reference.size());
+
+    {
+        VideoCapture cap(path, CAP_GSTREAMER);
+        ASSERT_TRUE(cap.isOpened());
+
+        for (int target : {5, 2, 8, 4, 11, 19, 23, 1, 13, 0, 17, 22, 12})
+        {
+            ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << "target " << target;
+            EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << "target " << target;
+            EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << "target " << target;
+
+            Mat frame;
+            ASSERT_TRUE(cap.read(frame)) << "target " << target;
+            EXPECT_EQ(target, nearestFrameIndex(frame, reference)) << "target " << target;
+        }
+    }
+
+    remove(path.c_str());
+}
+
+// Every frame, in shuffled order on one capture, must be exact and read back correctly.
+TEST(videoio_gstreamer_pos_frames, seek_to_every_frame_is_exact)
+{
+    if (!videoio_registry::hasBackend(CAP_GSTREAMER))
+        throw SkipTestException("GStreamer backend was not found");
+
+    for (const char* name : {"video/rotated_metadata.mp4", "video/big_buck_bunny.mp4"})
+    {
+        const std::string path = findDataFile(name);
+        std::vector<Mat> reference = readAllGstreamerFrames(path, 200);
+        ASSERT_FALSE(reference.empty()) << name;
+
+        std::vector<int> targets(reference.size());
+        std::iota(targets.begin(), targets.end(), 0);
+        RNG rng(42);
+        randShuffle(targets, 1.0, &rng);
+
+        VideoCapture cap(path, CAP_GSTREAMER);
+        ASSERT_TRUE(cap.isOpened()) << name;
+        for (int target : targets)
+        {
+            ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << name << " target " << target;
+            EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << name << " target " << target;
+            EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << name << " target " << target;
+            Mat frame;
+            ASSERT_TRUE(cap.read(frame)) << name << " target " << target;
+            EXPECT_EQ(target, nearestFrameIndex(frame, reference)) << name << " target " << target;
+        }
+    }
+}
+
+// Open GOP decoding can yield corrupted frames; a seek that claims exact must still deliver the right frame.
+TEST(videoio_gstreamer_pos_frames, open_gop_seek_does_not_claim_exact)
+{
+    if (!videoio_registry::hasBackend(CAP_GSTREAMER))
+        throw SkipTestException("GStreamer backend was not found");
+
+    std::string path = generateGopFixture("key-int-max=12 bframes=3 option-string=open-gop=1");
+    if (path.empty())
+        throw SkipTestException("GStreamer x264enc encoder was not available to build the test fixture");
+
+    std::vector<Mat> reference = readAllGstreamerFrames(path, gopFixtureFrameCount);
+    ASSERT_EQ((size_t)gopFixtureFrameCount, reference.size());
+
+    int exactCount = 0;
+    for (int target = 0; target < gopFixtureFrameCount; target++)
+    {
+        VideoCapture cap(path, CAP_GSTREAMER);
+        ASSERT_TRUE(cap.isOpened());
+        cap.set(CAP_PROP_POS_FRAMES, target);
+        if (cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)) != 1)
+            continue;
+        exactCount++;
+        Mat frame;
+        ASSERT_TRUE(cap.read(frame)) << "target " << target;
+        EXPECT_EQ(target, nearestFrameIndex(frame, reference)) << "target " << target;
+    }
+    // Without this the loop could skip every target and pass having checked nothing.
+    EXPECT_GT(exactCount, 0);
+
+    remove(path.c_str());
+}
+
+// Manual demuxer pipelines ending in appsink drop=1 (#24243) must still seek exactly from the PAUSED state.
+TEST(videoio_gstreamer_pos_frames, manual_demux_pipeline_seek_is_exact)
+{
+    if (!videoio_registry::hasBackend(CAP_GSTREAMER))
+        throw SkipTestException("GStreamer backend was not found");
+
+    std::string fixture = generateGopFixture();
+    if (fixture.empty())
+        throw SkipTestException("GStreamer x264enc encoder was not available to build the test fixture");
+
+    for (const std::string& path : {fixture, findDataFile("video/big_buck_bunny.mp4"), findDataFile("video/big_buck_bunny.mov")})
+    {
+        const std::string pipeline = "filesrc location=" + path + " ! qtdemux name=demux demux.video_0 ! decodebin"
+                                     " ! videoconvert ! video/x-raw, format=BGR ! appsink drop=1";
+        // Reference from a plain file capture: the manual pipeline's appsink syncs to the clock and decodes in real time.
+        std::vector<Mat> reference = readAllGstreamerFrames(path, gopFixtureFrameCount);
+        ASSERT_EQ((size_t)gopFixtureFrameCount, reference.size()) << path;
+
+        VideoCapture cap(pipeline, CAP_GSTREAMER);
+        ASSERT_TRUE(cap.isOpened()) << path;
+        // Read first so the pipeline is PLAYING, the state #24243 stopped the pipeline from.
+        Mat frame;
+        for (int i = 0; i < 3; i++)
+            ASSERT_TRUE(cap.read(frame)) << path;
+
+        for (int target : {17, 5, 22, 0, 13, 29, 8})
+        {
+            ASSERT_TRUE(cap.set(CAP_PROP_POS_FRAMES, target)) << path << " target " << target;
+            EXPECT_EQ(target, cvRound(cap.get(CAP_PROP_POS_FRAMES))) << path << " target " << target;
+            EXPECT_EQ(1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT))) << path << " target " << target;
+            ASSERT_TRUE(cap.read(frame)) << path << " target " << target;
+            EXPECT_EQ(target, nearestFrameIndex(frame, reference)) << path << " target " << target;
+        }
+    }
+    remove(fixture.c_str());
+}
+
+// matroskademux pipelines report a non-zero position at open, so POS_FRAMES is disabled; set() must refuse without claiming exact.
+TEST(videoio_gstreamer_pos_frames, manual_matroska_pipeline_refuses_seek)
+{
+    if (!videoio_registry::hasBackend(CAP_GSTREAMER))
+        throw SkipTestException("GStreamer backend was not found");
+
+    std::string path = generateGopFixture("key-int-max=12 bframes=0", "matroskamux", ".mkv");
+    if (path.empty())
+        throw SkipTestException("GStreamer x264enc encoder was not available to build the test fixture");
+
+    {
+        const std::string pipeline = "filesrc location=" + path + " ! matroskademux name=demux demux.video_0 ! decodebin"
+                                     " ! videoconvert ! video/x-raw, format=BGR ! appsink drop=1";
+        VideoCapture cap(pipeline, CAP_GSTREAMER);
+        ASSERT_TRUE(cap.isOpened());
+        Mat frame;
+        for (int i = 0; i < 3; i++)
+            ASSERT_TRUE(cap.read(frame));
+
+        EXPECT_FALSE(cap.set(CAP_PROP_POS_FRAMES, 17));
+        EXPECT_EQ(-1, cvRound(cap.get(CAP_PROP_POS_FRAMES_IS_EXACT)));
+        EXPECT_TRUE(cap.read(frame));
+    }
+    remove(path.c_str());
+}
 
 }} // namespace
