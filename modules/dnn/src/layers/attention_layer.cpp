@@ -485,71 +485,45 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
                 return QKV[i % 3] + (i / 3) * seq_len * qkv_head_sizes[i % 3];
             };
             const size_t col_ofs[3] = {0, qkv_hidden_sizes[0], qkv_hidden_sizes[0] + qkv_hidden_sizes[1]};
-            // Broadcast bias [NH] -> [BN, SH] into dst before gemm so beta=1 adds it implicitly.
-            auto fillBias = [&](size_t i) {
-                const size_t head_size = qkv_head_sizes[i % 3];
-                const float *src = bias_data + col_ofs[i % 3] + ((i / 3) % num_heads) * head_size;
-                float *dst = taskOutput(i);
-                for (size_t s = 0; s < seq_len; s++, dst += head_size)
-                    std::memcpy(dst, src, head_size * sizeof(float));
-            };
-            // Apply RoPE to Q/K in place (V is left untouched).
-            auto applyRotary = [&](size_t i) {
-                if (do_rotary && i % 3 < 2)
-                    rotationKernel(taskOutput(i), rope_table.ptr<const float>(), seq_len, qkv_head_sizes[i % 3]);
-            };
+            const float *rope_data = rope_table.ptr<const float>();
 
+            // One task per (task i, row chunk), about 4 per thread with at least 16 rows each, so the small
+            // per-head GEMMs balance across threads in one parallel_for_. Bias and RoPE are applied per tile.
+            const size_t nthreads = (size_t)std::max(1, getNumThreads());
+            const size_t max_chunks = std::max<size_t>(1, std::min((nthreads * 4 + loops - 1) / loops,
+                                                                   (seq_len + 15) / 16));
+            const size_t chunk_rows = std::max<size_t>(1, (seq_len + max_chunks - 1) / max_chunks);
+            const size_t row_chunks = (seq_len + chunk_rows - 1) / chunk_rows;
+            const bool use_mlas = !packed_qkv_mlas.empty();
             opt.multi_thread = false;
-            bool projected = false;
-#ifdef HAVE_MLAS
-            if (!packed_qkv_mlas.empty()) {
-                parallel_for_(Range(0, (int)loops), [&](const Range &r) {
-                    for (int i = r.start; i < r.end; i++)
-                        fillBias(i);
-                });
-                // All per-head GEMMs in one MLAS batch, which also splits each GEMM across threads.
-                // Q, K and V go in separate batches only if their head sizes differ.
-                const bool same_size = qkv_head_sizes[0] == qkv_head_sizes[1] && qkv_head_sizes[1] == qkv_head_sizes[2];
-                std::vector<const float*> A;
-                std::vector<const void*> B;
-                std::vector<float*> C;
-                for (size_t t = 0; t < (same_size ? 1u : 3u); t++) {
-                    A.clear(); B.clear(); C.clear();
-                    for (size_t i = 0; i < loops; i++) {
-                        if (!same_size && i % 3 != t)
-                            continue;
-                        A.push_back(taskInput(i));
-                        B.push_back(packed_qkv_mlas.ptr() + packed_qkv_ofs[i % 3] + ((i / 3) % num_heads) * packed_qkv_step[i % 3]);
-                        C.push_back(taskOutput(i));
+            parallel_for_(Range(0, (int)(loops * row_chunks)), [&](const Range &r) {
+                for (int task = r.start; task < r.end; task++) {
+                    const size_t i = task / row_chunks, t = i % 3, h = (i / 3) % num_heads;
+                    const size_t r0 = (task % row_chunks) * chunk_rows;
+                    const size_t rows = std::min(seq_len, r0 + chunk_rows) - r0;
+                    const size_t head_size = qkv_head_sizes[t];
+                    float *dst = taskOutput(i) + r0 * head_size;
+                    // Broadcast bias into dst so the beta=1 GEMM adds it.
+                    const float *bias_src = bias_data + col_ofs[t] + h * head_size;
+                    for (size_t s = 0; s < rows; s++)
+                        std::memcpy(dst + s * head_size, bias_src, head_size * sizeof(float));
+                    const float *src = taskInput(i) + r0 * input_hidden_size;
+                    if (use_mlas) {
+                        bool ok = mlasSgemmPackedSerial((int)rows, (int)head_size, (int)input_hidden_size, 1.f,
+                                                        src, (int)input_hidden_size,
+                                                        packed_qkv_mlas.ptr() + packed_qkv_ofs[t] + h * packed_qkv_step[t],
+                                                        1.f, dst, (int)head_size);
+                        CV_Assert(ok);
+                    } else {
+                        fastGemm(false, rows, head_size, input_hidden_size,
+                                 1.f, src, input_hidden_size,
+                                 packed_weights[t] + packed_weights_size[t] * h, 1.f, dst, head_size, opt);
                     }
-                    const int N = (int)qkv_head_sizes[t];
-                    projected = mlasSgemmPackedBatch(A.size(), (int)seq_len, N, (int)input_hidden_size, 1.f,
-                                                     A.data(), (int)input_hidden_size, B.data(), 1.f, C.data(), N);
-                    CV_Assert(projected);
+                    // RoPE on Q and K only.
+                    if (do_rotary && t < 2)
+                        rotationKernel(dst, rope_data + r0 * head_size, rows, head_size);
                 }
-                if (do_rotary) {
-                    parallel_for_(Range(0, (int)loops), [&](const Range &r) {
-                        for (int i = r.start; i < r.end; i++)
-                            applyRotary(i);
-                    });
-                }
-            }
-#endif
-            if (!projected) {
-                double nstripes = loops * seq_len * qkv_head_sizes[0] * input_hidden_size * (1 / 1024.0);
-                parallel_for_(Range(0, (int)loops), [&](const Range &r) {
-                    for (int i = r.start; i < r.end; i++) {
-                        fillBias(i);
-                        const size_t head_size = qkv_head_sizes[i % 3];
-                        auto *packed_weight = packed_weights[i % 3] + packed_weights_size[i % 3] * ((i / 3) % num_heads);
-                        // Single-threaded gemm; outer parallel_for_ already partitions over (batch, head, qkv).
-                        fastGemm(false, seq_len, head_size, input_hidden_size,
-                                1.f, taskInput(i), input_hidden_size,
-                                packed_weight, 1.f, taskOutput(i), head_size, opt);
-                        applyRotary(i);
-                    }
-                }, nstripes);
-            }
+            });
         }
 
         if (useFlashAttention(inputs.size(), (int)batch_size, (int)seq_len, (int)qkv_head_sizes[2]))
