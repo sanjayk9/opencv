@@ -533,20 +533,26 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
             const int S   = (int)seq_len;
             const int Dqk = (int)qkv_head_sizes[0];
             const int Dv  = (int)qkv_head_sizes[2];
-            // ORT-style default tiling, clamped to the actual sequence length.
-            const int q_block  = std::min(256, S);
             const int kv_block = std::min(256, S);
             const int threads  = std::max(1, cv::getNumThreads());
+            // MLAS gives each slice a fixed share of the B*H*ceil(S/q_block) tasks: split each head into equal query
+            // blocks (>= 32 rows) for ~4 tasks per thread, and pass more slices than threads so parallel_for_ balances them.
+            const int target = 4 * threads;
+            int chunks = (S + 255) / 256;
+            if (threads > 1)
+                chunks = std::max(chunks, std::min((target + B * H - 1) / (B * H), std::max(1, S / 32)));
+            const int q_block = (S + chunks - 1) / chunks;
+            const int slices  = threads > 1 ? std::min(B * H * ((S + q_block - 1) / q_block), target) : 1;
 
-            const size_t per_thread =
+            const size_t per_slice =
                 mlasFlashAttentionBufferBytesPerThread(q_block, kv_block, Dv);
-            flash_scratch.resize((size_t)threads * per_thread);
+            flash_scratch.resize((size_t)slices * per_slice);
 
             if (mlasFlashAttention(Q, K, V,
                                     outputs[0].ptr<float>(),
                                     B, H, S, S, Dqk, Dv, scale,
                                     q_block, kv_block,
-                                    flash_scratch.data(), threads))
+                                    flash_scratch.data(), slices))
             {
                 return;  // fast path done; outputs[0] is fully written
             }
