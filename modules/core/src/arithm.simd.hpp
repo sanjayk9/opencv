@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <type_traits>
 
 namespace cv {
 
@@ -308,7 +309,7 @@ TKernel getHypotFunc_(int T, int R);         // hypot = sqrt(x^2+y^2), float dep
 TKernel getAtan2Func_(int T, int R);         // atan2(y, x), radians (-pi, pi], float depths
 TKernel getCmpFunc_(TOp op, int T);
 TKernel getBitwiseFunc_(TOp op, int esz);                    // OP_AND / OP_OR / OP_XOR, by element size
-TKernel getNotFunc_(int esz);                                // OP_NOT, by element size
+TKernel getNotFunc_(int depth);                              // OP_NOT, by element size (CV_Bool: logical NOT)
 TKernel getAddWeightedFunc_(int T, int R);                   // OP_ADDW, a*alpha+b*beta+gamma (T x T -> R)
 TKernel getSelectFunc_(int mdepth, int T);   // OP_SELECT: 1-byte mask, a/b/dst of T (by esz)
 TKernel getClampFunc_(int T);                // OP_CLAMP: min(max(x, lo), hi), all operands of T
@@ -334,9 +335,17 @@ struct EwAdd {
     template<typename V> static V preproc(const V& a, const V&) { return a; }
     // Accumulate in the promoted type, NOT in W: for the native saturating path W is the narrow
     // lane type (schar/short/...), and (W)(a+b) would wrap in 8/16 bits before saturate_cast<Tr>
-    // could clamp. Letting a+b promote (narrow -> int) keeps saturation for 8/16-bit outputs and
-    // the natural wrap for 32/64-bit (both matching cv::add). The SIMD path already saturates.
+    // could clamp. Letting a+b promote (narrow -> int) keeps saturation for 8/16-bit outputs, and
+    // 32-bit outputs clamp from their int64 W. The SIMD path already saturates.
     template<typename W, typename ST> static W scl(W a, W b, ST) { return W(a + b); }
+    // 64-bit has no wider WT to hold a+b, so the generic path would overflow. Saturate to match
+    // the smaller depths.
+    static uint64_t scl(uint64_t a, uint64_t b, uint64_t) { uint64_t s = a + b; return s < a ? UINT64_MAX : s; }
+    static int64_t scl(int64_t a, int64_t b, int64_t)
+    {
+        return b > 0 ? (a > INT64_MAX - b ? INT64_MAX : a + b)
+                     : (a < INT64_MIN - b ? INT64_MIN : a + b);
+    }
 };
 
 struct EwSub {
@@ -353,6 +362,12 @@ struct EwSub {
     // 64-bit unsigned has no wider WT to hold a-b, so the generic path would wrap on underflow.
     // Saturate at 0 to match cv::subtract (8/16/32-bit already saturate via SIMD floor / wide WT).
     static uint64_t scl(uint64_t a, uint64_t b, uint64_t) { return uint64_t(a >= b)*(a - b); }
+    // 64-bit signed has no wider WT either, so saturate at both ends.
+    static int64_t scl(int64_t a, int64_t b, int64_t)
+    {
+        return b > 0 ? (a < INT64_MIN + b ? INT64_MIN : a - b)
+                     : (a > INT64_MAX + b ? INT64_MAX : a - b);
+    }
 };
 
 // mul/div compute in a wide FLOAT work type (W = float for <=16-bit/f16/bf/f32, double for
@@ -383,7 +398,7 @@ struct EwMul {
 #endif
     template<typename V, typename S> static V vec(const V& a, const V& b, const S&) { return vec(a, b); }
     template<typename V> static V preproc(const V& a, const V& s) { return v_mul(a, s); }
-    template<typename W, typename ST> static W scl(W a, W b, ST s) { return a * b * s; }
+    template<typename W, typename ST> static W scl(W a, W b, ST s) { return a * s * b; }
 };
 // div has two variants by the COMMON INPUT type (matching cv::'s per-type kernel choice): integer
 // inputs guard divide-by-zero -> 0 (cv:: iscalar_div); float inputs do NOT guard (cv:: fscalar_div,
@@ -573,6 +588,11 @@ static int scalarBinaryKernel(const void* src0_, size_t s0y, size_t s0x,
     s1y /= sizeof(T);
     dsty /= sizeof(Tr);
     CV_Assert((s0x|s1x) == 1u || (s0x|s1x) + (size_t)width == 1u);
+    if constexpr (std::is_same_v<Op, EwMul>) {
+        if ((s1x == 0 && s0x != 0) || (s1y == 0 && s0y != 0 && s0x == s1x)) {
+            std::swap(src0_, src1_); std::swap(s0y, s1y); std::swap(s0x, s1x);
+        }
+    }
 
     const T* src0 = (const T*)src0_;
     const T* src1 = (const T*)src1_;
@@ -916,6 +936,11 @@ static int vecBinaryKernel(const void* src0_, size_t s0y, size_t s0x,
     dsty /= sizeof(Tr);
 
     CV_Assert((s0x|s1x) == 1u || (s0x|s1x) + (size_t)width == 1u);
+    if constexpr (std::is_same_v<Op, EwMul>) {
+        if ((s1x == 0 && s0x != 0) || (s1y == 0 && s0y != 0 && s0x == s1x)) {
+            std::swap(src0_, src1_); std::swap(s0y, s1y); std::swap(s0x, s1x);
+        }
+    }
 
     const T* src0 = (const T*)src0_;
     const T* src1 = (const T*)src1_;
@@ -1401,7 +1426,8 @@ TKernel getCmpFunc_(TOp op, int T)
 
 // bitwise NOT: ~x. Single operand -> always a full contiguous array (no broadcast), so just a flat
 // per-row complement. SIMD for 1/2/4-byte elements; 8-byte uses the scalar tail (Vvec unused there).
-template<typename T, typename Vvec>
+// CV_Bool: any non-zero byte is true (as in convertTo), so its NOT is x == 0 (a full ~x would give 255/254).
+template<typename T, typename Vvec, bool isBool = false>
 static int notKernel(const void* src0_, size_t s0y, size_t s0x,
                      const void*, size_t, size_t, const void*, size_t, size_t,
                      void* dst_, size_t dsty, int width, int height,
@@ -1421,11 +1447,20 @@ static int notKernel(const void* src0_, size_t s0y, size_t s0x,
         if constexpr (sizeof(T) <= 4)
         {
             const int VECSZ = VTraits<Vvec>::vlanes();
-            for (; x <= width - VECSZ; x += VECSZ)
-                v_store(dst + x, v_not(vx_load(src0 + x)));
+            if constexpr (isBool)
+            {
+                const v_uint8 zero = vx_setzero_u8(), one = vx_setall_u8(1);
+                for (; x <= width - VECSZ; x += VECSZ)
+                    v_store(dst + x, v_and(v_eq(vx_load(src0 + x), zero), one));
+            }
+            else
+            {
+                for (; x <= width - VECSZ; x += VECSZ)
+                    v_store(dst + x, v_not(vx_load(src0 + x)));
+            }
         }
     #endif
-        for (; x < width; x++) dst[x] = (T)~src0[x];
+        for (; x < width; x++) dst[x] = isBool ? (T)(src0[x] == 0) : (T)~src0[x];
     }
     return 0;
 }
@@ -1456,10 +1491,12 @@ TKernel getBitwiseFunc_(TOp op, int esz)
     return {f, nullptr, 0};
 }
 
-TKernel getNotFunc_(int esz)
+TKernel getNotFunc_(int depth)
 {
     KernelFunc f = nullptr;
-    switch (esz)
+    if (depth == CV_Bool)
+        return {notKernel<uint8_t, v_uint8, true>, nullptr, 0};
+    switch (CV_ELEM_SIZE1(depth))
     {
     case 1: f = notKernel<uint8_t,  v_uint8 >; break;
     case 2: f = notKernel<uint16_t, v_uint16>; break;

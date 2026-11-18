@@ -152,7 +152,7 @@ void magnitude( InputArray src1, InputArray src2, OutputArray dst )
     CV_INSTRUMENT_REGION();
 
     int type = src1.type(), depth = src1.depth(), cn = src1.channels();
-    CV_Assert( src1.size() == src2.size() && type == src2.type() && (depth == CV_32F || depth == CV_64F));
+    CV_Assert( src1.sameSize(src2) && type == src2.type() && (depth == CV_32F || depth == CV_64F));
 
     CV_OCL_RUN(dst.isUMat() && src1.dims() <= 2 && src2.dims() <= 2,
                ocl_math_op(src1, src2, dst, OCL_OP_MAG))
@@ -188,7 +188,7 @@ void phase( InputArray src1, InputArray src2, OutputArray dst, bool angleInDegre
     CV_INSTRUMENT_REGION();
 
     int type = src1.type(), depth = src1.depth(), cn = src1.channels();
-    CV_Assert( src1.size() == src2.size() && type == src2.type() && (depth == CV_32F || depth == CV_64F));
+    CV_Assert( src1.sameSize(src2) && type == src2.type() && (depth == CV_32F || depth == CV_64F));
 
     CV_OCL_RUN(dst.isUMat() && src1.dims() <= 2 && src2.dims() <= 2,
                ocl_math_op(src1, src2, dst, angleInDegrees ? OCL_OP_PHASE_DEGREES : OCL_OP_PHASE_RADIANS))
@@ -1313,6 +1313,42 @@ bool checkRange(InputArray _src, bool quiet, Point* pt, double minVal, double ma
         else if( depth == CV_64S )
         {
             checkTypedRange<int64_t>(src, badPt, minVal, maxVal);
+        }
+        else if( depth == CV_8F_E4M3FN || depth == CV_8F_E4M3FNUZ )
+        {
+            // fp8 values are sign-magnitude, like float: CV_TOGGLE_FP8 maps them to int8 keys in
+            // the same order, so the values in [minVal, maxVal) have the keys in [ia, ib).
+            // NaN has no place in that order, so its key is checked separately (the other
+            // E4M3FN NaN, 0xff, maps to -128, below every ia).
+            const float* lut = depth == CV_8F_E4M3FN ? fp8_t::decodeLUT() : fp8a_t::decodeLUT();
+            const int nanKey = (schar)CV_TOGGLE_FP8(depth == CV_8F_E4M3FN ? 0x7f : 0x80);
+            int ia = 128, ib = 128;
+            for( int k = 127; k >= -128; k-- )
+            {
+                float v = lut[(uchar)CV_TOGGLE_FP8(k)];
+                if( v >= minVal )
+                    ia = k;
+                if( v >= maxVal )
+                    ib = k;
+            }
+
+            const uchar* isrc = src.ptr<uchar>();
+            size_t step = src.step/sizeof(isrc[0]);
+
+            for( ; badPt.x < 0 && size.height--; loc += size.width, isrc += step )
+            {
+                for( i = 0; i < size.width; i++ )
+                {
+                    int val = (schar)CV_TOGGLE_FP8(isrc[i]);
+
+                    if( val < ia || val >= ib || val == nanKey )
+                    {
+                        int pixelId = (loc + i) / cn;
+                        badPt = Point(pixelId % src.cols, pixelId / src.cols);
+                        break;
+                    }
+                }
+            }
         }
         else
         {

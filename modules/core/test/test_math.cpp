@@ -2198,6 +2198,31 @@ TEST(Core_CheckRange_INT_MAX, accuracy)
     ASSERT_TRUE( cv::checkRange(m) );
 }
 
+TEST(Core_MagnitudePhase, nd_input)
+{
+    const int sz[] = {2, 3, 4};
+    for (int depth : {CV_32F, CV_64F})
+    {
+        SCOPED_TRACE(depth);
+        Mat x(3, sz, depth), y(3, sz, depth);
+        randu(x, -10, 10);
+        randu(y, -10, 10);
+        Mat x2d = x.reshape(1, 6), y2d = y.reshape(1, 6);
+
+        Mat mag, mag2d;
+        ASSERT_NO_THROW(magnitude(x, y, mag));
+        magnitude(x2d, y2d, mag2d);
+        EXPECT_EQ(x.size, mag.size);
+        EXPECT_EQ(0, cvtest::norm(mag.reshape(1, 6), mag2d, NORM_INF));
+
+        Mat angle, angle2d;
+        ASSERT_NO_THROW(phase(x, y, angle, true));
+        phase(x2d, y2d, angle2d, true);
+        EXPECT_EQ(x.size, angle.size);
+        EXPECT_EQ(0, cvtest::norm(angle.reshape(1, 6), angle2d, NORM_INF));
+    }
+}
+
 TEST(Core_CheckRange_INT_MAX1, accuracy)
 {
     cv::Mat m(3, 3, CV_32SC1, cv::Scalar(INT_MAX));
@@ -2367,6 +2392,12 @@ TEST_P(Core_CheckRange_Float, accuracy)
     case CV_32F:
         src.ptr<float>(1)[bad_scalar] = inf;
         break;
+    case CV_8F_E4M3FN: // fp8 has no infinity, NaN is out of range as well
+        src.ptr<cv::fp8_t>(1)[bad_scalar] = cv::fp8_t(std::numeric_limits<float>::quiet_NaN());
+        break;
+    case CV_8F_E4M3FNUZ:
+        src.ptr<cv::fp8a_t>(1)[bad_scalar] = cv::fp8a_t(std::numeric_limits<float>::quiet_NaN());
+        break;
     default:
         FAIL() << "Unexpected depth: " << depth;
     }
@@ -2377,7 +2408,28 @@ TEST_P(Core_CheckRange_Float, accuracy)
 }
 
 INSTANTIATE_TEST_CASE_P(/*nothing*/, Core_CheckRange_Float,
-    testing::Values(CV_16F, CV_16BF, CV_32F));
+    testing::Values(CV_16F, CV_16BF, CV_32F, CV_8F_E4M3FN, CV_8F_E4M3FNUZ));
+
+// every fp8 value against the definition: in range iff minVal <= v < maxVal (NaN never is)
+typedef testing::TestWithParam<int> Core_CheckRange_FP8;
+
+TEST_P(Core_CheckRange_FP8, all_values)
+{
+    const int depth = GetParam();
+    const double ranges[][2] = { { -DBL_MAX, DBL_MAX }, { -1, 1 }, { 0, 0.3 }, { -0.3, 0 }, { 2, 2 } };
+    Mat src(1, 1, depth), f;
+    for (int b = 0; b < 256; b++)
+    {
+        src.ptr<uchar>()[0] = (uchar)b;
+        src.convertTo(f, CV_32F);
+        const float v = f.at<float>(0);
+        for (const auto& r : ranges)
+            EXPECT_EQ(v >= r[0] && v < r[1], checkRange(src, true, NULL, r[0], r[1]))
+                << "byte " << b << ", range [" << r[0] << ", " << r[1] << ")";
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(/*nothing*/, Core_CheckRange_FP8, testing::Values(CV_8F_E4M3FN, CV_8F_E4M3FNUZ));
 
 typedef testing::TestWithParam<int> Core_CheckRange_ExtendedInteger;
 
@@ -2474,6 +2526,44 @@ TEST(Core_GEMM, inplace_complex)
         EXPECT_EQ(0., cvtest::norm(aliasB, expected, NORM_INF)) << "destination aliases B";
     }
 }
+
+// A 1D Mat is a single row, so gemm should treat it the same as a 1 x N matrix
+typedef testing::TestWithParam<cvtest::MatDepth> Core_GEMM_1D;
+
+TEST_P(Core_GEMM_1D, input)
+{
+    const int type = GetParam();
+    const Mat v64 = Mat_<double>({5}, {1, 2, 3, 4, 5});   // 1D Mat: dims == 1
+    Mat v;
+    v64.convertTo(v, type);
+    ASSERT_EQ(1, v.dims);
+    const Mat row = v.reshape(0, 1);                    // same values as a 2D 1 x 5 Mat
+
+    Mat inner, expectedInner;                           // 1x5 * (1x5)^T = 1x1
+    gemm(v, v, 1, noArray(), 0, inner, GEMM_2_T);
+    gemm(row, row, 1, noArray(), 0, expectedInner, GEMM_2_T);
+    EXPECT_EQ(0., cvtest::norm(inner, expectedInner, NORM_INF)) << "inner product";
+
+    Mat outer, expectedOuter;                           // (1x5)^T * 1x5 = 5x5
+    gemm(v, v, 1, noArray(), 0, outer, GEMM_1_T);
+    gemm(row, row, 1, noArray(), 0, expectedOuter, GEMM_1_T);
+    EXPECT_EQ(0., cvtest::norm(outer, expectedOuter, NORM_INF)) << "outer product";
+
+    Mat withC, expectedWithC;                           // v * I + v, where C is 1D too
+    const Mat I = Mat::eye(5, 5, type);
+    gemm(v, I, 1, v, 1, withC);
+    gemm(row, I, 1, row, 1, expectedWithC);
+    EXPECT_EQ(0., cvtest::norm(withC, expectedWithC, NORM_INF)) << "1D C";
+
+    Mat preallocated({5}, type);                        // 1D output that already has the right size
+    const uchar* oldData = preallocated.data;
+    gemm(v, I, 1, noArray(), 0, preallocated);          // v * I = v
+    EXPECT_EQ(1, preallocated.dims) << "preallocated 1D D";
+    EXPECT_EQ(oldData, preallocated.data) << "preallocated 1D D";
+    EXPECT_EQ(0., cvtest::norm(preallocated, v, NORM_INF)) << "preallocated 1D D";
+}
+
+INSTANTIATE_TEST_CASE_P(/*nothing*/, Core_GEMM_1D, testing::Values(CV_32F, CV_64F));
 
 TEST(Core_Invert, accuracy) { Core_InvertTest test; test.safe_run(); }
 TEST(Core_Mahalanobis, accuracy) { Core_MahalanobisTest test; test.safe_run(); }
