@@ -35,10 +35,20 @@
 // instance so mlasi.h links — it's never read because we never call MlasQgemm.
 extern "C++" const MLAS_GEMM_QUANT_DISPATCH MlasGemmQuantDispatchDefault{};
 
+static thread_local int mlas_serial_depth = 0;
+
+// Lets a caller that already runs inside a parallel_for_ task keep MLAS from splitting its GEMM.
+extern "C" void opencv_dnn_mlas_serial(int enter)
+{
+    mlas_serial_depth += enter ? 1 : -1;
+}
+
 // Always 4 tiles per thread rather than detecting mixed-core-type CPUs (Intel P/E, ARM
 // big.LITTLE, ...): no portable query covers all of them (see arithm_expr.cpp).
 extern "C" int opencv_dnn_mlas_max_threads()
 {
+    if (mlas_serial_depth > 0)
+        return 1;
     int n = cv::getNumThreads();
     return (n > 0 ? n : 1) * 4;
 }
