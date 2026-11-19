@@ -200,6 +200,32 @@ TEST(Core_GemmEngine, single_thread_is_bit_exact)
     }
 }
 
+// Transformer-like products, where the SME2 kernels and the split by work size are used:
+// row counts that are not a multiple of the 4-row ZA reads, and column tails.
+TEST(Core_GemmEngine, transformer_shapes_accuracy)
+{
+    RNG& rng = theRNG();
+    const size_t zero = 0;
+    for (const GemmShape& s : { GemmShape{ 197, 192, 192 }, GemmShape{ 50, 2304, 768 },
+                                GemmShape{ 197, 771, 129 }, GemmShape{ 61, 67, 513 } })
+        for (int t = 0; t < 2; t++)
+            for (const auto& ab : alphaBeta)
+            {
+                const bool tB = t != 0;
+                Mat A = randomMat(s.m, s.k, rng);
+                Mat B = tB ? randomMat(s.n, s.k, rng) : randomMat(s.k, s.n, rng);
+                Mat C = randomMat(s.m, s.n, rng), C0 = C.clone(), C1 = C.clone();
+                const int flags = tB ? CV_HAL_GEMM_2_T : 0;
+                hal::gemm32fBatch(1, A.ptr<float>(), &zero, A.step, B.ptr<float>(), &zero, B.step,
+                                  C.ptr<float>(), &zero, C.step, s.m, s.n, s.k, ab[0], ab[1], flags);
+                checkGemm(A, B, C0, C, ab[0], ab[1], false, tB);
+                hal::gemm32fBatch(1, A.ptr<float>(), &zero, A.step, B.ptr<float>(), &zero, B.step,
+                                  C1.ptr<float>(), &zero, C1.step, s.m, s.n, s.k, ab[0], ab[1],
+                                  flags | CV_HAL_GEMM_SINGLE_THREAD);
+                EXPECT_EQ(0., cvtest::norm(C, C1, NORM_INF)) << s.m << "x" << s.n << "x" << s.k;
+            }
+}
+
 TEST(Core_GemmEngine, cv_gemm_accuracy)
 {
     RNG& rng = theRNG();
