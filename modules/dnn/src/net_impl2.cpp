@@ -966,6 +966,14 @@ void Net::Impl::forwardMainGraph(InputArrayOfArrays inputs, OutputArrayOfArrays 
     dimvalues.assign(nsymdims, -1);
     layersTimings.assign(totalLayers + 1, 0.);
 
+    // Re-plan by the sizes the previous inference recorded (the way ONNX Runtime plans its arena), before
+    // this one runs: forward-to-layer reads this run's temporaries from the buffers after it returns.
+    if (replanBuffersBySize()) {
+#ifdef HAVE_CUDA
+        cudaGraphReset();  // buffers were re-planned under the recorded graph
+#endif
+    }
+
     forwardGraph(mainGraph, inputs, outputs, true);
 
     // Feed present.* outputs back as past_key_values.* inputs for the next step (causal-lm-with-past).
