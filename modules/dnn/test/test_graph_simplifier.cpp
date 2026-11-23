@@ -149,6 +149,14 @@ TEST_F(Test_Graph_Simplifier, AttentionSubgraph) {
     test("attention_single_head", "Attention");
 }
 
+TEST_F(Test_Graph_Simplifier, AttentionExporterForms) {
+    // timm ViT/BEiT, HF SigLIP and SAM2 Hiera exports
+    test("attention_vit_runtime_scale", "Attention");
+    test("attention_beit_rel_bias", "Attention");
+    test("attention_siglip_mul_scale", "Attention");
+    test("attention_hiera_unbind", "Attention");
+}
+
 TEST_F(Test_Graph_Simplifier, BiasedMatMulSubgraph) {
     /* Test for 1 subgraphs
         - BiasedMatMulSubgraph

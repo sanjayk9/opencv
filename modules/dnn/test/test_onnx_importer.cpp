@@ -3769,6 +3769,19 @@ TEST_P(Test_ONNX_layers, Attention) {
 TEST_P(Test_ONNX_layers, AttentionSingleHead) {
     testONNXModels("attention_single_head");
 }
+// Attention blocks in the forms timm (ViT, BEiT), HF (SigLIP) and SAM2 (Hiera) export.
+TEST_P(Test_ONNX_layers, AttentionViTRuntimeScale) {
+    testONNXModels("attention_vit_runtime_scale");
+}
+TEST_P(Test_ONNX_layers, AttentionBEiTRelativeBias) {
+    testONNXModels("attention_beit_rel_bias");
+}
+TEST_P(Test_ONNX_layers, AttentionSigLIPMulScale) {
+    testONNXModels("attention_siglip_mul_scale");
+}
+TEST_P(Test_ONNX_layers, AttentionHieraUnbind) {
+    testONNXModels("attention_hiera_unbind");
+}
 TEST_P(Test_ONNX_layers, PyTorchAttentionSingleHead) {
     // 5.x specific bug: https://github.com/opencv/opencv/issues/25921
     if (target == DNN_TARGET_OPENCL)
