@@ -398,6 +398,16 @@ elseif(ARM OR AARCH64)
     endif()
     set(CPU_DISPATCH "NEON_FP16;NEON_BF16;NEON_DOTPROD" CACHE STRING "${HELP_CPU_DISPATCH}")
     ocv_default_baseline_detect_and_check_dispatch()
+    # SME is not a dispatch target: only streaming-mode code may be built with these flags.
+    # armv9-a is avoided on purpose, it lets plain SVE leak into non-streaming code.
+    if(NOT MSVC)
+      ocv_update(CPU_SME_FLAGS_ON "-march=armv8.6-a+sme")
+      ocv_check_compiler_flag(CXX "${CPU_SME_FLAGS_ON}" HAVE_SME_INTRINSICS "${OpenCV_SOURCE_DIR}/cmake/checks/cpu_sme.cpp")
+      # SME2 kernels are selected per function (target attribute) and at run time, so the flags stay the same.
+      if(HAVE_SME_INTRINSICS)
+        ocv_check_compiler_flag(CXX "${CPU_SME_FLAGS_ON}" HAVE_SME2_INTRINSICS "${OpenCV_SOURCE_DIR}/cmake/checks/cpu_sme2.cpp")
+      endif()
+    endif()
   endif()
 
 elseif(MIPS)
